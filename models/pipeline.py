@@ -42,16 +42,16 @@ if __name__ == "__main__":
 
     B, T, D, K = 8, 16, 512, 9
 
-    # Istanziazione Baseline (EXP-01)
+    # Baseline (EXP-01)
     neck = IdentityNeck(in_dim=D)
     head = MeanPoolingClassifierHead(in_dim=D, num_classes=K)
     pipeline = ARPipeline(backbone=None, neck=neck, head=head)
 
-    # Mock delle feature lette da file .pt estratto offline
+    # Mock: offline features from .pt file
     dummy_features = torch.randn(B, T, D)
     logits = pipeline(dummy_features)
 
     assert logits.shape == (B, K), f"Error: expected ({B}, {K}), got {logits.shape}"
-    print(f"✓ ARPipeline successfully created!")
-    print(f"  Input Feature Shape: {dummy_features.shape}")
-    print(f"  Output Logits Shape: {logits.shape}")
+    print(f"ARPipeline successfully created!")
+    print(f"Input Feature Shape: {dummy_features.shape}")
+    print(f"Output Logits Shape: {logits.shape}")
