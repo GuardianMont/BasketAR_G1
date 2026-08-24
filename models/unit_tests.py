@@ -4,6 +4,7 @@ import torch.nn as nn
 from typing import Optional, List
 
 from .base import BaseBackbone
+from .backbone import X3DSBackbone
 from .heads import MeanPoolingClassifierHead
 from .necks import BiGRUNeck, TCNNeck, IdentityNeck
 from .pipeline import ARPipeline
@@ -22,6 +23,128 @@ class MockBackbone(BaseBackbone):
         out = self.conv(x)  # (B, 16, T, H, W)
         out = out.mean(dim=[-2, -1]).transpose(1, 2)  # Global Spatial Pool -> (B, T, 16)
         return self.fc(out)  # (B, T, D)
+
+
+class FakeX3D(nn.Module):
+    """
+    Small X3D-compatible model used to test the wrapper
+    without requiring PyTorchVideo weights or a GPU.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.blocks = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv3d(3, 24, kernel_size=1),
+                nn.BatchNorm3d(24),
+                nn.ReLU(),
+            ),
+            nn.Sequential(
+                nn.Conv3d(24, 48, kernel_size=1),
+                nn.BatchNorm3d(48),
+                nn.ReLU(),
+            ),
+            nn.Sequential(
+                nn.Conv3d(48, 96, kernel_size=1),
+                nn.BatchNorm3d(96),
+                nn.ReLU(),
+            ),
+            nn.Sequential(
+                nn.Conv3d(96, 192, kernel_size=1),
+                nn.BatchNorm3d(192),
+                nn.ReLU(),
+            ),
+            nn.Identity(),  # Mock classification head.
+        ])
+
+
+def test_x3d_s_backbone_output_shape():
+    """X3D-S wrapper preserves T and returns (B, T, 512)."""
+    B, C, T, H, W, D = 2, 3, 8, 16, 16, 512
+
+    backbone = X3DSBackbone(
+        out_dim=D,
+        pretrained=False,
+        freeze_x3d=True,
+        x3d_model=FakeX3D(),
+    )
+
+    x = torch.randn(B, C, T, H, W)
+    features = backbone(x)
+
+    assert features.shape == (B, T, D)
+    assert torch.isfinite(features).all()
+
+
+def test_x3d_s_backbone_freeze_behavior():
+    """
+    Frozen X3D trunk remains frozen/eval while the
+    192 -> 512 projection remains trainable.
+    """
+    backbone = X3DSBackbone(
+        out_dim=512,
+        pretrained=False,
+        freeze_x3d=True,
+        x3d_model=FakeX3D(),
+    )
+
+    backbone.train()
+
+    assert not backbone.trunk.training
+    assert all(
+        not parameter.requires_grad
+        for parameter in backbone.trunk.parameters()
+    )
+    assert any(
+        parameter.requires_grad
+        for parameter in backbone.projection.parameters()
+    )
+
+    backbone.unfreeze_x3d()
+
+    assert all(
+        parameter.requires_grad
+        for parameter in backbone.trunk.parameters()
+    )
+
+
+def test_full_pipeline_with_x3d_backbone():
+    """X3D-S -> IdentityNeck -> Classifier integration test."""
+    B, C, T, H, W, K = 2, 3, 8, 16, 16, 9
+
+    backbone = X3DSBackbone(
+        out_dim=512,
+        pretrained=False,
+        freeze_x3d=True,
+        x3d_model=FakeX3D(),
+    )
+
+    neck = IdentityNeck(in_dim=backbone.out_dim)
+
+    head = MeanPoolingClassifierHead(
+        in_dim=neck.out_dim,
+        num_classes=K,
+    )
+
+    pipeline = ARPipeline(
+        backbone=backbone,
+        neck=neck,
+        head=head,
+    )
+
+    x = torch.randn(B, C, T, H, W)
+    logits = pipeline(x)
+
+    assert logits.shape == (B, K)
+    assert torch.isfinite(logits).all()
+
+    logits.sum().backward()
+
+    assert backbone.projection.weight.grad is not None
+    assert all(
+        parameter.grad is None
+        for parameter in backbone.trunk.parameters()
+    )
 
 
 def test_exp01_baseline_identity():
