@@ -3,7 +3,7 @@ from typing import List, Dict, Any, Tuple
 import numpy as np
 
 
-def pad_and_collate_video_batch(batch: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
+def pad_and_collate_video_batch(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
     """
     Collate function that groups variable length clips.
     Generates a padded tensor, the binary attention mask and lengths
@@ -40,11 +40,14 @@ def pad_and_collate_video_batch(batch: List[Dict[str, Any]]) -> Dict[str, torch.
     else:
         raise ValueError(f"Unsupported tensor dimension: {sample_elem.dim()}")
 
+    sample_ids = [b["sample_id"] for b in batch]
+
     return {
         "x": padded_data,
         "labels": labels,
         "lengths": lengths,
-        "attention_mask": mask
+        "attention_mask": mask,
+        "sample_ids": sample_ids,
     }
 
 
