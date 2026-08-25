@@ -3,10 +3,10 @@ import torch
 import torch.nn as nn
 from typing import Optional, List
 
-from .base import BaseBackbone
-from .heads import MeanPoolingClassifierHead
-from .necks import BiGRUNeck, TCNNeck, IdentityNeck
-from .pipeline import ARPipeline
+from models.base import BaseBackbone
+from models.heads import MeanPoolingClassifierHead
+from models.necks import BiGRUNeck, TCNNeck, IdentityNeck
+from models.pipeline import ARPipeline
 
 
 # Real but minimal Mock Backbone to test 5D tensor flow without external dependencies
