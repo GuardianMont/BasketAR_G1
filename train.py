@@ -16,6 +16,7 @@ from losses import FocalLoss
 from data.dataset import ActionRecognitionDataset
 from data.utils import pad_and_collate_video_batch, compute_class_weights
 from data.samplers import BucketSampler
+from utils.logger import ExperimentLogger
 
 
 def load_preextracted_features(pt_file_path: str):
@@ -121,6 +122,12 @@ def train_and_validate(experiment_name, config, train_loader, val_loader, class_
     
     for run_idx, params in enumerate(combinations):
         print(f"\n--> [Run {run_idx + 1}/{len(combinations)}] Hyperparameters Configuration: {params}")
+
+        tb_logger = ExperimentLogger(
+            log_dir="experiments/runs", 
+            experiment_name=experiment_name, 
+            run_id=run_idx + 1
+        )
         
         # Dynamic components construction
         backbone = config['components']['backbone'](params)
@@ -131,7 +138,7 @@ def train_and_validate(experiment_name, config, train_loader, val_loader, class_
         model = ARPipeline(backbone=backbone, neck=neck, head=head).to(device)
         optimizer = torch.optim.Adam(model.parameters(), lr=params.get('lr', 1e-3))
         
-        epochs = 3  # Reduced epochs for fast testing
+        epochs = 3
         best_run_f1 = 0.0
         best_run_acc = 0.0
         best_run_epoch = 0
@@ -160,6 +167,7 @@ def train_and_validate(experiment_name, config, train_loader, val_loader, class_
             # --- VALIDATION ---
             model.eval()
             all_preds, all_labels = [], []
+            val_loss = 0.0
             
             with torch.no_grad():
                 val_pbar = tqdm(val_loader, desc=f"Epoch {epoch + 1}/{epochs} [Val]")
@@ -169,14 +177,25 @@ def train_and_validate(experiment_name, config, train_loader, val_loader, class_
                     lengths = batch["lengths"]
                     
                     logits = model(x, lengths=lengths)
+                    loss = criterion(logits, labels)
+                    val_loss += loss.item()
+
                     preds = torch.argmax(logits, dim=1)
-                    
                     all_preds.extend(preds.cpu().numpy())
                     all_labels.extend(labels.cpu().numpy())
             
             acc = accuracy_score(all_labels, all_preds)
             macro_f1 = f1_score(all_labels, all_preds, average='macro', zero_division=0)
             avg_train_loss = train_loss / len(train_loader)
+            avg_val_loss = val_loss / len(val_loader)
+
+            tb_logger.log_epoch(
+                epoch=epoch + 1, 
+                train_loss=avg_train_loss, 
+                val_loss=avg_val_loss, 
+                val_acc=acc, 
+                val_f1=macro_f1
+            )
             
             print(f"Epoch {epoch + 1} Result | Train Loss: {avg_train_loss:.4f} | Val Acc: {acc:.4f} | Val Macro-F1: {macro_f1:.4f}")
             
@@ -187,9 +206,11 @@ def train_and_validate(experiment_name, config, train_loader, val_loader, class_
                 best_run_epoch = epoch + 1
                 
                 os.makedirs("checkpoints", exist_ok=True)
-                weight_path = f"checkpoints/{experiment_name}_run{run_idx}_best.pt"
+                weight_path = f"checkpoints/{experiment_name}_run{run_idx + 1}_best.pt"
                 torch.save(model.state_dict(), weight_path)
                 print(f"    [CHECKPOINT] Weights saved to: {weight_path}")
+
+        tb_logger.close()
         
         run_record = {
             "experiment_name": experiment_name,
