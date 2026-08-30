@@ -18,6 +18,7 @@ from data.utils import pad_and_collate_video_batch, compute_class_weights
 from data.samplers import BucketSampler
 from utils.logger import ExperimentLogger
 
+from utils.plotting import save_confusion_matrix_plot, get_confusion_matrix_tensor
 
 def load_preextracted_features(pt_file_path: str):
     """
@@ -60,59 +61,116 @@ def load_preextracted_features(pt_file_path: str):
     return payload["samples"]
 
 
+FEATURE_DIM = 5 # 192 + 5 + 768
+NUM_CLASSES = 9
+
 # Experiments in nested dictionary format
 EXPERIMENTS = {
     "EXP-01_Baseline_Identity": {
         "components": {
-            "backbone": lambda params: None,
-            "neck": lambda params: IdentityNeck(in_dim=512),
-            "head": lambda params: MeanPoolingClassifierHead(in_dim=512, num_classes=9, dropout=params['dropout']),
-            "loss": lambda params, weights: nn.CrossEntropyLoss(weight=weights)
+            "neck": lambda params: IdentityNeck(in_dim=FEATURE_DIM),
+            "head": lambda params: MeanPoolingClassifierHead(
+                in_dim=FEATURE_DIM, num_classes=NUM_CLASSES, dropout=params["dropout"]
+            ),
+            "loss": lambda params, weights: nn.CrossEntropyLoss(weight=weights),
         },
         "grid": {
-            "dropout": [0.2, 0.4],
-            "lr": [1e-3]
-        }
+            "dropout": [0.0, 0.2, 0.4],
+            "lr": [1e-3, 3e-4],
+        },
     },
     "EXP-02_BiGRU_Neck": {
         "components": {
-            "backbone": lambda params: None,
-            "neck": lambda params: BiGRUNeck(in_dim=512, hidden_dim=params['gru_dim'], dropout=0.2),
-            "head": lambda params: MeanPoolingClassifierHead(in_dim=params['gru_dim'] * 2, num_classes=9, dropout=0.3),
-            "loss": lambda params, weights: nn.CrossEntropyLoss(weight=weights)
+            "neck": lambda params: BiGRUNeck(
+                in_dim=FEATURE_DIM,
+                hidden_dim=params["hidden_dim"],
+                num_layers=params["num_layers"],
+                dropout=params["gru_dropout"],
+            ),
+            "head": lambda params: MeanPoolingClassifierHead(
+                in_dim=params["hidden_dim"] * 2, num_classes=NUM_CLASSES, dropout=0.0
+            ),
+            "loss": lambda params, weights: nn.CrossEntropyLoss(weight=weights),
         },
         "grid": {
-            "gru_dim": [128, 256],
-            "lr": [1e-3]
-        }
+            "hidden_dim": [128, 256],
+            "num_layers": [1, 2],
+            "gru_dropout": [0.0, 0.2],
+            "lr": [1e-3],
+        },
     },
     "EXP-03_TCN_Neck": {
         "components": {
-            "backbone": lambda params: None,
-            "neck": lambda params: TCNNeck(in_dim=512, num_channels=[128, 256], kernel_size=3, dropout=0.2),
-            "head": lambda params: MeanPoolingClassifierHead(in_dim=256, num_classes=9, dropout=0.3),
-            "loss": lambda params, weights: nn.CrossEntropyLoss(weight=weights)
+            "neck": lambda params: TCNNeck(
+                in_dim=FEATURE_DIM,
+                num_channels=params["num_channels"],
+                kernel_size=params["kernel_size"],
+                dropout=params["tcn_dropout"],
+            ),
+            "head": lambda params: MeanPoolingClassifierHead(
+                in_dim=params["num_channels"][-1], num_classes=NUM_CLASSES, dropout=0.3
+            ),
+            "loss": lambda params, weights: nn.CrossEntropyLoss(weight=weights),
         },
         "grid": {
-            "lr": [1e-3]
-        }
+            "kernel_size": [3, 5],
+            "tcn_dropout": [0.1, 0.2],
+            "num_channels": [[128, 256], [256, 512], [128, 256, 512]],
+            "lr": [1e-3, 3e-4],
+        },
     },
-    "EXP-04_Focal_Loss": {
+    "EXP-04_Attention_Head": {
         "components": {
-            "backbone": lambda params: None,
-            "neck": lambda params: BiGRUNeck(in_dim=512, hidden_dim=256, dropout=0.2),
-            "head": lambda params: MeanPoolingClassifierHead(in_dim=512, num_classes=9, dropout=0.3),
-            "loss": lambda params, weights: FocalLoss(alpha=weights, gamma=params['gamma'])
+            "neck": lambda params: TCNNeck(
+                in_dim=FEATURE_DIM,
+                num_channels=params["num_channels"],
+                kernel_size=3,
+                dropout=0.2,
+            ),
+            "head": lambda params: AttentionClassifierHead(
+                in_dim=params["num_channels"][-1], num_classes=NUM_CLASSES, dropout=params["dropout"]
+            ),
+            "loss": lambda params, weights: nn.CrossEntropyLoss(weight=weights),
         },
         "grid": {
-            "gamma": [1.5, 2.0],
-            "lr": [1e-3]
-        }
-    }
+            "num_channels": [[128, 256], [256, 512]],
+            "dropout": [0.2, 0.4],
+            "lr": [1e-3, 3e-4],
+        },
+    },
+    "EXP-05_Hybrid_2D_3D": {
+        "components": {
+            "neck": lambda params: TCNNeck(
+                in_dim=FEATURE_DIM,  # 960 (192 X3D + 768 ConvNeXt)
+                num_channels=params["num_channels"],
+                kernel_size=params["kernel_size"],
+                dropout=params["dropout"],
+            ),
+            "head": lambda params: AttentionClassifierHead(
+                in_dim=params["num_channels"][-1], num_classes=NUM_CLASSES, dropout=0.3
+            ),
+            "loss": lambda params, weights: nn.CrossEntropyLoss(weight=weights),
+        },
+        "grid": {
+            "num_channels": [[256, 512], [256, 512, 512]],
+            "kernel_size": [3, 5],
+            "dropout": [0.2, 0.3],
+            "lr": [1e-3, 3e-4],
+        },
+    },
 }
 
 
-def train_and_validate(experiment_name, config, train_loader, val_loader, class_weights, device):
+def train_and_validate(
+    experiment_name,
+    config,
+    train_loader,
+    val_loader,
+    class_weights,
+    device,
+    epochs,
+    patience,
+):
     print(f"\n{'='*60}\nRunning Experiment: {experiment_name}\n{'='*60}")
     
     keys, values = zip(*config['grid'].items())
@@ -121,27 +179,30 @@ def train_and_validate(experiment_name, config, train_loader, val_loader, class_
     results = []
     
     for run_idx, params in enumerate(combinations):
-        print(f"\n--> [Run {run_idx + 1}/{len(combinations)}] Hyperparameters Configuration: {params}")
+        run_id = run_idx + 1
+        print(f"\n--> [Run {run_id}/{len(combinations)}] Hyperparameters Configuration: {params}")
 
         tb_logger = ExperimentLogger(
             log_dir="experiments/runs", 
             experiment_name=experiment_name, 
-            run_id=run_idx + 1
+            run_id=run_id
         )
         
         # Dynamic components construction
-        backbone = config['components']['backbone'](params)
         neck = config['components']['neck'](params)
         head = config['components']['head'](params)
         criterion = config['components']['loss'](params, class_weights.to(device))
         
-        model = ARPipeline(backbone=backbone, neck=neck, head=head).to(device)
+        model = ARPipeline(backbone=None, neck=neck, head=head).to(device)
         optimizer = torch.optim.Adam(model.parameters(), lr=params.get('lr', 1e-3))
         
-        epochs = 3
-        best_run_f1 = 0.0
+        best_run_f1 = -1.0
         best_run_acc = 0.0
         best_run_epoch = 0
+        epochs_without_improvement = 0
+        
+        # for confusion matrix
+        best_preds, best_labels = [], []
         
         for epoch in range(epochs):
             # --- TRAINING ---
@@ -199,27 +260,54 @@ def train_and_validate(experiment_name, config, train_loader, val_loader, class_
             
             print(f"Epoch {epoch + 1} Result | Train Loss: {avg_train_loss:.4f} | Val Acc: {acc:.4f} | Val Macro-F1: {macro_f1:.4f}")
             
-            # Performance and checkpoint logging
-            if macro_f1 >= best_run_f1:
+            # Checkpoint & Best Predictions tracking
+            if macro_f1 > best_run_f1:
                 best_run_f1 = macro_f1
                 best_run_acc = acc
                 best_run_epoch = epoch + 1
+                epochs_without_improvement = 0
                 
+                best_preds = all_preds
+                best_labels = all_labels
+
                 os.makedirs("checkpoints", exist_ok=True)
-                weight_path = f"checkpoints/{experiment_name}_run{run_idx + 1}_best.pt"
+                weight_path = f"checkpoints/{experiment_name}_run{run_id}_best.pt"
                 torch.save(model.state_dict(), weight_path)
                 print(f"    [CHECKPOINT] Weights saved to: {weight_path}")
+            else:
+                epochs_without_improvement += 1
+
+                if epochs_without_improvement >= patience:
+                    print(
+                        f"    [EARLY STOPPING] No Val Macro-F1 improvement "
+                        f"for {patience} epochs. "
+                        f"Best epoch: {best_run_epoch}, "
+                        f"Best Macro-F1: {best_run_f1:.4f}"
+                    )
+                    break
+
+        # -confusion matrix code
+        if best_preds and best_labels:
+            plot_dir = "experiments/plots"
+            plot_path = os.path.join(plot_dir, f"{experiment_name}_run{run_id}_cm.png")
+            
+            save_confusion_matrix_plot(best_labels, best_preds, plot_path)
+            print(f"    [PLOT] Confusion matrix saved to: {plot_path}")
+            
+            cm_tensor = get_confusion_matrix_tensor(best_labels, best_preds)
+            tb_logger.log_image("Confusion_Matrix/Best", cm_tensor, step=best_run_epoch)
 
         tb_logger.close()
         
         run_record = {
             "experiment_name": experiment_name,
-            "run_id": run_idx + 1,
+            "run_id": run_id,
             "hyperparameters": str(params),
             "best_epoch": best_run_epoch,
             "val_accuracy": round(best_run_acc, 4),
             "val_macro_f1": round(best_run_f1, 4),
-            "checkpoint_path": f"checkpoints/{experiment_name}_run{run_idx}_best.pt"
+            "checkpoint_path": f"checkpoints/{experiment_name}_run{run_id}_best.pt",
+            "confusion_matrix_path": f"experiments/plots/{experiment_name}_run{run_id}_cm.png"
         }
         results.append(run_record)
         
@@ -230,13 +318,40 @@ def train_and_validate(experiment_name, config, train_loader, val_loader, class_
         
     return results
 
-
+import argparse
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="Train one BasketAR ablation experiment."
+    )
+
+    parser.add_argument(
+        "--experiment",
+        required=True,
+        choices=list(EXPERIMENTS.keys()),
+        help="Single ablation stage to run.",
+    )
+
+    parser.add_argument(
+        "--epochs",
+        type=int,
+        default=30,
+        help="Maximum epochs for each hyperparameter configuration.",
+    )
+
+    parser.add_argument(
+        "--patience",
+        type=int,
+        default=5,
+        help="Early-stopping patience on validation Macro-F1.",
+    )
+
+    args = parser.parse_args()
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[INFO] Device detected and in use: {device}")
     
-    train_samples = load_preextracted_features("features/train_features.pt")
-    val_samples = load_preextracted_features("features/val_features.pt")
+    train_samples = load_preextracted_features("features/train_tracker.pt")
+    val_samples = load_preextracted_features("features/val_tracker.pt")
     
     train_dataset = ActionRecognitionDataset(samples=train_samples, is_feature_dataset=True)
     val_dataset = ActionRecognitionDataset(samples=val_samples, is_feature_dataset=True)
@@ -259,11 +374,24 @@ if __name__ == "__main__":
     train_labels = [s["label"] for s in train_samples]
     class_weights = compute_class_weights(train_labels, num_classes=9, method="inverse")
     
-    # Experiments execution
+    # Execute a single ablation stage.
     all_experiment_results = []
-    for exp_name, config in EXPERIMENTS.items():
-        exp_results = train_and_validate(exp_name, config, train_loader, val_loader, class_weights, device)
-        all_experiment_results.extend(exp_results)
+
+    exp_name = args.experiment
+    config = EXPERIMENTS[exp_name]
+
+    exp_results = train_and_validate(
+        exp_name,
+        config,
+        train_loader,
+        val_loader,
+        class_weights,
+        device,
+        epochs=args.epochs,
+        patience=args.patience,
+    )
+
+    all_experiment_results.extend(exp_results)
 
     # Logging output to "experiments" directory
     experiments_dir = "experiments"
@@ -276,5 +404,5 @@ if __name__ == "__main__":
     df_results = pd.DataFrame(all_experiment_results)
     df_results.to_csv(results_csv_path, index=False)
         
-    print(f"\n[SUCCESS] All experiments completed successfully!")
+    print(f"\n[SUCCESS] Experiment completed successfully!")
     print(f"[LOG] Performance metrics for all configurations saved to: '{results_csv_path}'")

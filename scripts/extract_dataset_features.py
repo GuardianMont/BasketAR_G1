@@ -17,7 +17,7 @@ from data.utils import pad_and_collate_video_batch
 from models import X3DSBackbone
 from scripts.extract_features import extract_features_offline
 
-from models import X3DSBackbone, ConvNeXt2DBackbone, Hybrid2D3DBackbone
+from models import X3DSBackbone, ConvNeXt2DBackbone, CompositeBackbone, BallTrackerBackbone
 
 
 LABEL_TO_ID = {
@@ -175,8 +175,6 @@ class ManifestVideoDataset(Dataset):
         }
 
 
-
-
 def split_and_save_hybrid_payload(hybrid_payload: Dict[str, Any], base_output_path: Path):
     """
     Prende il payload estratto dall'HybridBackbone (D=960) e genera due file separati:
@@ -237,20 +235,13 @@ def main():
 
     parser.add_argument(
         "--dataset-root",
-        default="../dataset/dataset_hd",
+        default="dataset/dataset_hd",
     )
 
     parser.add_argument(
         "--split",
         choices=["train", "val", "test"],
         required=True,
-    )
-
-    parser.add_argument(
-        "--backbone",
-        choices=["x3d", "convnext", "hybrid"],
-        default="hybrid",
-        help="Choose backbone extractor: 'x3d' (D=192), 'convnext' (D=768), or 'hybrid' (D=960).",
     )
 
     parser.add_argument("--output", required=True)
@@ -285,18 +276,15 @@ def main():
     print(f"[INFO] samples: {len(dataset)}")
     print(f"[INFO] CUDA: {torch.cuda.is_available()}")
     print(f"[INFO] output target: {args.output}")
-    print(f"[INFO] backbone selected: {args.backbone}")
 
-    # Costruzione della backbone in base all'argomento passato
-    if args.backbone == "x3d":
-        backbone = X3DSBackbone(out_dim=192, pretrained=True, freeze_x3d=True)
-    elif args.backbone == "convnext":
-        backbone = ConvNeXt2DBackbone(pretrained=True)
-    elif args.backbone == "hybrid":
-        b3d = X3DSBackbone(out_dim=192, pretrained=True, freeze_x3d=True)
-        b2d = ConvNeXt2DBackbone(pretrained=True)
-        backbone = Hybrid2D3DBackbone(backbone_3d=b3d, backbone_2d=b2d)
+    backbone_list = [
+        # X3DSBackbone(out_dim=192, pretrained=True, freeze_x3d=True),  # 3D (D=192)
+        # ConvNeXt2DBackbone(pretrained=True),                         # 2D (D=768)
+        BallTrackerBackbone(model_path="yolov8n.pt")                 # Tracking (D=5)
+    ]
+    # Totale D = 192 + 768 + 5 = 965
 
+    backbone = CompositeBackbone(backbone_list)
     backbone.freeze()
 
     # Estrazione principale
@@ -314,9 +302,6 @@ def main():
         f"D={payload['feature_dim']}"
     )
 
-    # Se l'estrazione è Ibrida, genera automaticamente anche i due file separati
-    if args.backbone == "hybrid":
-        split_and_save_hybrid_payload(payload, Path(args.output))
 
 
 if __name__ == "__main__":
