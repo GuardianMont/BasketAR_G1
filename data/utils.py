@@ -3,36 +3,45 @@ from typing import List, Dict, Any, Tuple
 import numpy as np
 
 
+from typing import Any, Dict, List
+import torch
+
+
 def pad_and_collate_video_batch(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Collate function that groups variable length clips.
+
+    Generates a padded tensor, the binary attention mask, lengths, and handles
+    both single-label and hierarchical phase labels (label_p1, label_p2,
+    label_p3).
     """
-    Collate function that groups variable length clips.
-    Generates a padded tensor, the binary attention mask and lengths
-    """
-    labels = torch.tensor([b["label"] for b in batch], dtype=torch.long)
     lengths = torch.tensor([b["length"] for b in batch], dtype=torch.long)
-    
+
     max_len = int(lengths.max().item())
     batch_size = len(batch)
-    
+
     sample_elem = batch[0]["data"]
-    
+
     if sample_elem.dim() == 2:
         # Pre-extracted: (T, D) -> Output Batch: (B, T_max, D)
         D = sample_elem.shape[1]
-        padded_data = torch.zeros(batch_size, max_len, D, dtype=sample_elem.dtype)
+        padded_data = torch.zeros(
+            batch_size, max_len, D, dtype=sample_elem.dtype
+        )
         mask = torch.zeros(batch_size, max_len, dtype=torch.bool)
-        
+
         for i, b in enumerate(batch):
             seq_len = b["length"]
             padded_data[i, :seq_len] = b["data"]
             mask[i, :seq_len] = True  # False for padding
-            
+
     elif sample_elem.dim() == 4:
         # Raw video: (C, T, H, W) -> Output Batch: (B, C, T_max, H, W)
         C, _, H, W = sample_elem.shape
-        padded_data = torch.zeros(batch_size, C, max_len, H, W, dtype=sample_elem.dtype)
+        padded_data = torch.zeros(
+            batch_size, C, max_len, H, W, dtype=sample_elem.dtype
+        )
         mask = torch.zeros(batch_size, max_len, dtype=torch.bool)
-        
+
         for i, b in enumerate(batch):
             seq_len = b["length"]
             padded_data[i, :, :seq_len, :, :] = b["data"]
@@ -42,13 +51,26 @@ def pad_and_collate_video_batch(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
 
     sample_ids = [b["sample_id"] for b in batch]
 
-    return {
+    collated = {
         "x": padded_data,
-        "labels": labels,
         "lengths": lengths,
         "attention_mask": mask,
         "sample_ids": sample_ids,
     }
+
+    # compatible with single label and hierarchical label
+    if "label" in batch[0]:
+        collated["labels"] = torch.tensor(
+            [b["label"] for b in batch], dtype=torch.long
+        )
+
+    for phase_key in ["label_p1", "label_p2", "label_p3", "label_orig"]:
+        if phase_key in batch[0]:
+            collated[phase_key] = torch.tensor(
+                [b[phase_key] for b in batch], dtype=torch.long
+            )
+
+    return collated
 
 
 def compute_class_weights(labels: List[int], num_classes: int = 9, method: str = "inverse") -> torch.Tensor:
