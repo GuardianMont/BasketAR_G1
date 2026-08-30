@@ -19,6 +19,10 @@ class ExperimentLogger:
         self.writer.add_scalar("Validation/Accuracy", val_acc, epoch)
         self.writer.add_scalar("Validation/Macro_F1", val_f1, epoch)
 
+    def log_image(self, tag: str, image_tensor, step: int):
+        """Logs a PyTorch Image Tensor to TensorBoard."""
+        self.writer.add_image(tag, image_tensor, global_step=step)
+
     def close(self):
         self.writer.flush()
         self.writer.close()
