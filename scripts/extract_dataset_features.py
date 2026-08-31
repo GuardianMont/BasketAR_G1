@@ -18,6 +18,7 @@ from models import X3DSBackbone
 from scripts.extract_features import extract_features_offline
 
 from models import X3DSBackbone, ConvNeXt2DBackbone, CompositeBackbone, BallTrackerBackbone
+from data import RandomTemporalShift, VideoHorizontalFlip
 
 
 LABEL_TO_ID = {
@@ -42,10 +43,12 @@ class ManifestVideoDataset(Dataset):
         root,
         split,
         num_frames=16,
-        crop_size=182,
+        target_size=192,
         limit=None,
+        transform=None
     ):
         self.root = Path(root)
+        self.transform = transform
 
         df = pd.read_csv(self.root / "manifest.csv")
         df = df[df["split"] == split].reset_index(drop=True)
@@ -62,7 +65,7 @@ class ManifestVideoDataset(Dataset):
 
         self.rows = df.to_dict("records")
         self.num_frames = num_frames
-        self.crop_size = crop_size
+        self.target_size = target_size
 
     def __len__(self):
         return len(self.rows)
@@ -83,35 +86,43 @@ class ManifestVideoDataset(Dataset):
             [total_frames - 1] *
             (self.num_frames - total_frames)
         )
+
+        if isinstance(self.transform, RandomTemporalShift):
+            indices = self.transform(indices, total_frames)
+
         return indices
 
     def _preprocess_frame(self, frame):
         array = frame.to_ndarray(format="rgb24")
-
         x = (
             torch.from_numpy(array)
             .permute(2, 0, 1)
             .contiguous()
             .float()
             / 255.0
-        )
+        )  # (C, H, W)
 
-        x = F.resize(
-            x,
-            self.crop_size,
-            antialias=True,
-        )
+        # Shrink the longest side to target and the shortest accordingly (mantaining the aspect ratio)
+        _, h, w = x.shape
+        if h > w:
+            new_h, new_w = self.target_size, int(w * (self.target_size / h))
+        else:
+            new_h, new_w = int(h * (self.target_size / w)), self.target_size
 
-        x = F.center_crop(
-            x,
-            [self.crop_size, self.crop_size],
-        )
+        x = F.resize(x, [new_h, new_w], antialias=True)
 
-        x = F.normalize(
-            x,
-            mean=X3D_MEAN,
-            std=X3D_STD,
-        )
+        # Apply paddding to have target x target resolution
+        pad_h = self.target_size - new_h
+        pad_w = self.target_size - new_w
+        padding = [
+            pad_w // 2,
+            pad_h // 2,
+            pad_w - pad_w // 2,
+            pad_h - pad_h // 2,
+        ]  # [left, top, right, bottom]
+        x = F.pad(x, padding, fill=0)
+
+        x = F.normalize(x, mean=X3D_MEAN, std=X3D_STD)
 
         return x
 
@@ -153,9 +164,15 @@ class ManifestVideoDataset(Dataset):
             )
 
         frames = [decoded[i] for i in indices]
+        clip = torch.stack(frames, dim=1)  # (C, T, H, W)
 
-        # (T,C,H,W) -> (C,T,H,W)
-        return torch.stack(frames, dim=1)
+        # Se il transform e' VideoHorizontalFlip, lo applichiamo alla clip
+        is_flipped = False
+        if isinstance(self.transform, VideoHorizontalFlip):
+            clip = self.transform(clip)
+            is_flipped = True
+
+        return clip, is_flipped
 
     def __getitem__(self, index):
         row = self.rows[index]
@@ -165,13 +182,14 @@ class ManifestVideoDataset(Dataset):
         if not path.exists():
             raise FileNotFoundError(path)
 
-        clip = self._decode_clip(path)
+        clip, is_flipped = self._decode_clip(path)
 
         return {
             "data": clip,
             "label": LABEL_TO_ID[row["label"]],
             "length": clip.shape[1],
             "sample_id": row["clip_id"],
+            "is_flipped": is_flipped
         }
 
 
@@ -244,22 +262,37 @@ def main():
         required=True,
     )
 
+    parser.add_argument(
+        "--transform",
+        choices=["none", "horizontal_flip", "temporal_shift"],
+        default="none",
+        help="Tipo di augmentation deterministica da applicare durante l'estrazione.",
+    )
+
     parser.add_argument("--output", required=True)
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--workers", type=int, default=2)
     parser.add_argument("--num-frames", type=int, default=16)
-    parser.add_argument("--crop-size", type=int, default=182)
+    parser.add_argument("--target-size", type=int, default=192)
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--overwrite", action="store_true")
 
     args = parser.parse_args()
 
+    if args.transform == "horizontal_flip":
+        transform = VideoHorizontalFlip()
+    elif args.transform == "temporal_shift":
+        transform = RandomTemporalShift(shift_range=3)
+    else:
+        transform = None
+
     dataset = ManifestVideoDataset(
         root=args.dataset_root,
         split=args.split,
         num_frames=args.num_frames,
-        crop_size=args.crop_size,
+        target_size=args.target_size,
         limit=args.limit,
+        transform=transform
     )
 
     loader = DataLoader(
@@ -276,9 +309,10 @@ def main():
     print(f"[INFO] samples: {len(dataset)}")
     print(f"[INFO] CUDA: {torch.cuda.is_available()}")
     print(f"[INFO] output target: {args.output}")
+    print(f"[INFO] augmentation: {args.transform}")
 
     backbone_list = [
-        # X3DSBackbone(out_dim=192, pretrained=True, freeze_x3d=True),  # 3D (D=192)
+        X3DSBackbone(out_dim=192, pretrained=True, freeze_x3d=True),  # 3D (D=192)
         # ConvNeXt2DBackbone(pretrained=True),                         # 2D (D=768)
         BallTrackerBackbone(model_path="yolov8n.pt")                 # Tracking (D=5)
     ]
