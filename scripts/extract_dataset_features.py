@@ -1,9 +1,7 @@
 from __future__ import annotations
 
 import argparse
-import sys
 from pathlib import Path
-from typing import Any, Dict, List, Optional
 
 import av
 import pandas as pd
@@ -11,15 +9,17 @@ import torch
 import torch.nn as nn
 import torchvision.transforms.functional as F
 from torch.utils.data import DataLoader, Dataset
-from torchvision.models import convnext_tiny, ConvNeXt_Tiny_Weights
 
-from data.utils import pad_and_collate_video_batch
-from models import X3DSBackbone
-from scripts.extract_features import extract_features_offline
-
-from models import X3DSBackbone, ConvNeXt2DBackbone, CompositeBackbone, BallTrackerBackbone
 from data import RandomTemporalShift, VideoHorizontalFlip
-
+from data.utils import pad_and_collate_video_batch
+from models import (
+    BallTrackerBackbone,
+    CompositeBackbone,
+    ConvNeXt2DBackbone,
+    X3DLBackbone,
+    X3DSBackbone,
+)
+from scripts.extract_features import extract_features_offline
 
 LABEL_TO_ID = {
     "passaggio": 0,
@@ -38,14 +38,15 @@ X3D_STD = (0.225, 0.225, 0.225)
 
 
 class ManifestVideoDataset(Dataset):
+
     def __init__(
         self,
         root,
         split,
         num_frames=16,
-        target_size=192,
+        target_size=312,
         limit=None,
-        transform=None
+        transform=None,
     ):
         self.root = Path(root)
         self.transform = transform
@@ -82,10 +83,7 @@ class ManifestVideoDataset(Dataset):
             ]
 
         indices = list(range(total_frames))
-        indices.extend(
-            [total_frames - 1] *
-            (self.num_frames - total_frames)
-        )
+        indices.extend([total_frames - 1] * (self.num_frames - total_frames))
 
         if isinstance(self.transform, RandomTemporalShift):
             indices = self.transform(indices, total_frames)
@@ -100,9 +98,8 @@ class ManifestVideoDataset(Dataset):
             .contiguous()
             .float()
             / 255.0
-        )  # (C, H, W)
+        )
 
-        # Shrink the longest side to target and the shortest accordingly (mantaining the aspect ratio)
         _, h, w = x.shape
         if h > w:
             new_h, new_w = self.target_size, int(w * (self.target_size / h))
@@ -111,7 +108,6 @@ class ManifestVideoDataset(Dataset):
 
         x = F.resize(x, [new_h, new_w], antialias=True)
 
-        # Apply paddding to have target x target resolution
         pad_h = self.target_size - new_h
         pad_w = self.target_size - new_w
         padding = [
@@ -119,12 +115,11 @@ class ManifestVideoDataset(Dataset):
             pad_h // 2,
             pad_w - pad_w // 2,
             pad_h - pad_h // 2,
-        ]  # [left, top, right, bottom]
-        x = F.pad(x, padding, fill=0)
+        ]
+        x_raw = F.pad(x, padding, fill=0)
 
-        x = F.normalize(x, mean=X3D_MEAN, std=X3D_STD)
-
-        return x
+        x_norm = F.normalize(x_raw, mean=X3D_MEAN, std=X3D_STD)
+        return x_norm, x_raw
 
     def _decode_clip(self, path):
         with av.open(str(path)) as container:
@@ -133,151 +128,121 @@ class ManifestVideoDataset(Dataset):
 
         if total_frames <= 0:
             with av.open(str(path)) as container:
-                total_frames = sum(
-                    1 for _ in container.decode(video=0)
-                )
+                total_frames = sum(1 for _ in container.decode(video=0))
 
         indices = self._uniform_indices(total_frames)
         wanted = set(indices)
-        decoded = {}
+        decoded_norm = {}
+        decoded_raw = {}
 
         with av.open(str(path)) as container:
-            for frame_index, frame in enumerate(
-                container.decode(video=0)
-            ):
+            for frame_index, frame in enumerate(container.decode(video=0)):
                 if frame_index not in wanted:
                     continue
 
-                decoded[frame_index] = (
-                    self._preprocess_frame(frame)
-                )
+                x_n, x_r = self._preprocess_frame(frame)
+                decoded_norm[frame_index] = x_n
+                decoded_raw[frame_index] = x_r
 
-                if len(decoded) == len(wanted):
+                if len(decoded_norm) == len(wanted):
                     break
 
-        missing = sorted(wanted - set(decoded))
-
+        missing = sorted(wanted - set(decoded_norm))
         if missing:
             raise RuntimeError(
-                f"Could not decode frames {missing} "
-                f"from {path}"
+                f"Could not decode frames {missing} from {path}"
             )
 
-        frames = [decoded[i] for i in indices]
-        clip = torch.stack(frames, dim=1)  # (C, T, H, W)
+        frames_norm = [decoded_norm[i] for i in indices]
+        frames_raw = [decoded_raw[i] for i in indices]
+        clip_norm = torch.stack(frames_norm, dim=1)
+        clip_raw = torch.stack(frames_raw, dim=1)
 
-        # Se il transform e' VideoHorizontalFlip, lo applichiamo alla clip
         is_flipped = False
         if isinstance(self.transform, VideoHorizontalFlip):
-            clip = self.transform(clip)
+            clip_norm = self.transform(clip_norm)
+            clip_raw = self.transform(clip_raw)
             is_flipped = True
 
-        return clip, is_flipped
+        return clip_norm, clip_raw, is_flipped
 
     def __getitem__(self, index):
         row = self.rows[index]
-
         path = self.root / row["path"]
 
         if not path.exists():
             raise FileNotFoundError(path)
 
-        clip, is_flipped = self._decode_clip(path)
+        clip_norm, clip_raw, is_flipped = self._decode_clip(path)
 
         return {
-            "data": clip,
+            "x_norm": clip_norm,
+            "x_raw": clip_raw,
             "label": LABEL_TO_ID[row["label"]],
-            "length": clip.shape[1],
+            "length": clip_norm.shape[1],
             "sample_id": row["clip_id"],
-            "is_flipped": is_flipped
+            "is_flipped": is_flipped,
         }
 
 
-def split_and_save_hybrid_payload(hybrid_payload: Dict[str, Any], base_output_path: Path):
+def build_backbone_and_filename(
+    config_type: str,
+    backbone_type: str = "X3D-L",
+    tracker_model_path: str = "yolov8n.pt",
+) -> tuple[nn.Module, str]:
+    """Costruisce la CompositeBackbone dagli import ufficiali di models e
+
+    definisce il nome del file.
     """
-    Prende il payload estratto dall'HybridBackbone (D=960) e genera due file separati:
-    1. <base_output_path>_3d.pt (D=192)
-    2. <base_output_path>_2d.pt (D=768)
-    """
-    samples_3d = []
-    samples_2d = []
+    backbone_list = []
+    filename_parts = ["3d"]
 
-    for s in hybrid_payload["samples"]:
-        data_hybrid = s["data"]  # (T, 960)
-        
-        data_3d = data_hybrid[:, :192].contiguous()
-        data_2d = data_hybrid[:, 192:].contiguous()
+    is_large = backbone_type.upper() == "X3D-L"
+    if is_large:
+        # X3D-L nativa estrae D=432
+        backbone_list.append(
+            X3DLBackbone(out_dim=432, pretrained=True, freeze_x3d=True)
+        )
+        print(f"[DEBUG DIRECT] Created X3DLBackbone with out_dim={backbone_list[-1].out_dim}")
+    else:
+        # X3D-S nativa estrae D=192
+        backbone_list.append(
+            X3DSBackbone(out_dim=192, pretrained=True, freeze_x3d=True)
+        )
+        print(f"[DEBUG DIRECT] Created X3DSBackbone with out_dim={backbone_list[-1].out_dim}")
 
-        samples_3d.append({
-            "id": s["id"],
-            "data": data_3d,
-            "label": s["label"],
-            "num_frames": s["num_frames"]
-        })
-        
-        samples_2d.append({
-            "id": s["id"],
-            "data": data_2d,
-            "label": s["label"],
-            "num_frames": s["num_frames"]
-        })
+    if "2d" in config_type:
+        backbone_list.append(ConvNeXt2DBackbone(pretrained=True))
+        filename_parts.append("2d")
 
-    payload_3d = {
-        "format_version": 1,
-        "backbone": "X3DSBackbone",
-        "feature_dim": 192,
-        "num_samples": len(samples_3d),
-        "samples": samples_3d
-    }
+    if "tracker" in config_type:
+        backbone_list.append(
+            BallTrackerBackbone(model_path=tracker_model_path)
+        )
+        filename_parts.append("tracker")
 
-    payload_2d = {
-        "format_version": 1,
-        "backbone": "ConvNeXt2DBackbone",
-        "feature_dim": 768,
-        "num_samples": len(samples_2d),
-        "samples": samples_2d
-    }
+    if is_large:
+        filename_parts.append("L")
 
-    path_3d = base_output_path.parent / f"{base_output_path.stem}_3d.pt"
-    path_2d = base_output_path.parent / f"{base_output_path.stem}_2d.pt"
+    output_filename = f"{'_'.join(filename_parts)}.pt"
+    composite = CompositeBackbone(backbone_list)
+    composite.freeze()
 
-    torch.save(payload_3d, path_3d)
-    torch.save(payload_2d, path_2d)
-
-    print(f"[SPLIT] Separate 3D features saved to: '{path_3d}' (D=192)")
-    print(f"[SPLIT] Separate 2D features saved to: '{path_2d}' (D=768)")
+    print(f"[DEBUG COMPOSITE] Total composite.out_dim = {composite.out_dim}")
+    return composite, output_filename
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Extract offline features using 3D, 2D, or Hybrid Backbones.")
+def extract_all_configurations(args):
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-    parser.add_argument(
-        "--dataset-root",
-        default="dataset/dataset_hd",
+    target_size = 312 if args.backbone_type.upper() == "X3D-L" else 192
+
+    print(
+        f"\n{'='*70}\n[RUNNER] Inizio estrazione per SPLIT:"
+        f" {args.split.upper()} | Model: {args.backbone_type} | Target Size:"
+        f" {target_size}\n{'='*70}"
     )
-
-    parser.add_argument(
-        "--split",
-        choices=["train", "val", "test"],
-        required=True,
-    )
-
-    parser.add_argument(
-        "--transform",
-        choices=["none", "horizontal_flip", "temporal_shift"],
-        default="none",
-        help="Tipo di augmentation deterministica da applicare durante l'estrazione.",
-    )
-
-    parser.add_argument("--output", required=True)
-    parser.add_argument("--batch-size", type=int, default=4)
-    parser.add_argument("--workers", type=int, default=2)
-    parser.add_argument("--num-frames", type=int, default=16)
-    parser.add_argument("--target-size", type=int, default=192)
-    parser.add_argument("--limit", type=int, default=None)
-    parser.add_argument("--overwrite", action="store_true")
-
-    args = parser.parse_args()
 
     if args.transform == "horizontal_flip":
         transform = VideoHorizontalFlip()
@@ -290,9 +255,9 @@ def main():
         root=args.dataset_root,
         split=args.split,
         num_frames=args.num_frames,
-        target_size=args.target_size,
+        target_size=target_size,
         limit=args.limit,
-        transform=transform
+        transform=transform,
     )
 
     loader = DataLoader(
@@ -305,37 +270,75 @@ def main():
         collate_fn=pad_and_collate_video_batch,
     )
 
-    print(f"[INFO] split: {args.split}")
-    print(f"[INFO] samples: {len(dataset)}")
-    print(f"[INFO] CUDA: {torch.cuda.is_available()}")
-    print(f"[INFO] output target: {args.output}")
-    print(f"[INFO] augmentation: {args.transform}")
-
-    backbone_list = [
-        X3DSBackbone(out_dim=192, pretrained=True, freeze_x3d=True),  # 3D (D=192)
-        # ConvNeXt2DBackbone(pretrained=True),                         # 2D (D=768)
-        BallTrackerBackbone(model_path="yolov8n.pt")                 # Tracking (D=5)
+    configs_to_run = [
+        "3d",
+        "3d_tracker",
     ]
-    # Totale D = 192 + 768 + 5 = 965
 
-    backbone = CompositeBackbone(backbone_list)
-    backbone.freeze()
+    for idx, cfg in enumerate(configs_to_run, 1):
+        backbone, filename = build_backbone_and_filename(
+            config_type=cfg,
+            backbone_type=args.backbone_type,
+            tracker_model_path=args.tracker_model_path,
+        )
 
-    # Estrazione principale
-    payload = extract_features_offline(
-        backbone=backbone,
-        dataloader=loader,
-        output_path=args.output,
-        device="cuda" if torch.cuda.is_available() else "cpu",
-        overwrite=args.overwrite,
+        output_path = output_dir / f"{args.split}_{filename}"
+
+        print(
+            f"\n[{idx}/{len(configs_to_run)}] Estrazione Configurazione:"
+            f" '{cfg}' -> Output: '{output_path.name}'"
+        )
+
+        payload = extract_features_offline(
+            backbone=backbone,
+            dataloader=loader,
+            output_path=str(output_path),
+            device="cuda" if torch.cuda.is_available() else "cpu",
+            overwrite=args.overwrite,
+        )
+
+        print(
+            f"[DONE] File salvato: '{output_path.name}' | Campioni:"
+            f" {payload['num_samples']} | Dimensioni D: {payload['feature_dim']}"
+        )
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Offline Feature Extraction Suite per Basket Action Recognition."
     )
 
-    print(
-        f"[DONE] Main payload saved to '{args.output}': "
-        f"{payload['num_samples']} samples, "
-        f"D={payload['feature_dim']}"
+    parser.add_argument("--dataset-root", default="dataset/dataset_hd")
+    parser.add_argument(
+        "--split", choices=["train", "val", "test"], required=True
     )
+    parser.add_argument(
+        "--output-dir",
+        default="features",
+        help="Directory di destinazione per salvataggio file .pt",
+    )
+    parser.add_argument(
+        "--backbone-type",
+        choices=["X3D-S", "X3D-L"],
+        default="X3D-L",
+    )
+    parser.add_argument(
+        "--tracker-model-path",
+        default="yolov8n.pt",
+    )
+    parser.add_argument(
+        "--transform",
+        choices=["none", "horizontal_flip", "temporal_shift"],
+        default="none",
+    )
+    parser.add_argument("--batch-size", type=int, default=4)
+    parser.add_argument("--workers", type=int, default=4)
+    parser.add_argument("--num-frames", type=int, default=16)
+    parser.add_argument("--limit", type=int, default=None)
+    parser.add_argument("--overwrite", action="store_true")
 
+    args = parser.parse_args()
+    extract_all_configurations(args)
 
 
 if __name__ == "__main__":
