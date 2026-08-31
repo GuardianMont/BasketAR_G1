@@ -167,6 +167,113 @@ class X3DSBackbone(BaseBackbone):
 
         return self.projection(features)  # (B, T, out_dim)
 
+from typing import Optional
+import torch
+import torch.nn as nn
+
+from .base import BaseBackbone
+
+
+class X3DLBackbone(BaseBackbone):
+    NATIVE_OUT_DIM = 432
+
+    def __init__(
+        self,
+        out_dim: int = 432,
+        pretrained: bool = True,
+        freeze_x3d: bool = True,
+        progress: bool = True,
+        x3d_model: Optional[nn.Module] = None,
+    ):
+        super().__init__(out_dim=out_dim)
+
+        model = x3d_model or self._load_x3d_l(
+            pretrained=pretrained, progress=progress
+        )
+        
+        # 1. Trunk (Stage 0 -> Stage 4)
+        self.trunk = nn.Sequential(*list(model.blocks[:-1]))
+        
+        # 2. Estraggiamo i sotto-layer della Head che proiettano 192 -> 432
+        head_pool = model.blocks[5].pool
+        self.head_proj = nn.Sequential(
+            head_pool.pre_conv,
+            head_pool.pre_norm,
+            head_pool.pre_act
+        )
+
+        self.projection = (
+            nn.Identity()
+            if out_dim == self.NATIVE_OUT_DIM
+            else nn.Linear(self.NATIVE_OUT_DIM, out_dim)
+        )
+
+        if freeze_x3d:
+            self.freeze()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x shape: (B, 3, 16, 312, 312)
+        x_feat = self.trunk(x)             # (B, 192, 16, 10, 10)
+        x_feat = self.head_proj(x_feat)     # (B, 432, 16, 10, 10)
+        
+        # Spatial Average Pooling solo su H' e W' -> preserva T=16
+        x_feat = x_feat.mean(dim=(-2, -1))  # (B, 432, 16)
+        x_feat = x_feat.permute(0, 2, 1).contiguous() # (B, 16, 432)
+
+        return self.projection(x_feat)
+
+    @staticmethod
+    def _load_x3d_l(pretrained: bool, progress: bool) -> nn.Module:
+        try:
+            from pytorchvideo.models.hub import x3d_l
+        except ImportError as exc:
+            raise ImportError(
+                "X3DLBackbone requires PyTorchVideo. Install it with `pip"
+                " install pytorchvideo`."
+            ) from exc
+
+        return x3d_l(pretrained=pretrained, progress=progress)
+
+    @staticmethod
+    def _validate_x3d_model(model: nn.Module) -> None:
+        if not hasattr(model, "blocks"):
+            raise ValueError(
+                "Provided x3d_model does not have a 'blocks' attribute."
+            )
+
+    def freeze_x3d(self) -> None:
+        """Freeze the X3D-L trunk parameters and set BatchNorm layers to eval."""
+        for param in self.trunk.parameters():
+            param.requires_grad = False
+        self.trunk.eval()
+        self._x3d_frozen = True
+
+    def unfreeze_x3d(self) -> None:
+        """Unfreeze the X3D-L trunk parameters for fine-tuning."""
+        for param in self.trunk.parameters():
+            param.requires_grad = True
+        self._x3d_frozen = False
+
+    def freeze(self) -> None:
+        """Freeze the entire backbone."""
+        for param in self.parameters():
+            param.requires_grad = False
+        self._x3d_frozen = True
+        self.eval()
+
+    def unfreeze(self) -> None:
+        """Unfreeze the entire backbone."""
+        for param in self.parameters():
+            param.requires_grad = True
+        self._x3d_frozen = False
+        self.train()
+
+    def train(self, mode: bool = True) -> "X3DLBackbone":
+        super().train(mode)
+        if self._x3d_frozen:
+            self.trunk.eval()
+        return self
+
 
 from torchvision.models import convnext_tiny, ConvNeXt_Tiny_Weights
 
@@ -270,6 +377,15 @@ class BallTrackerBackbone(nn.Module):
         self.eval()
         self.model.eval()
 
+    def flip_ball_tracking_coords(coords: torch.Tensor) -> torch.Tensor:
+        """
+        Flips tracking coordinates if the Video Flip augmentation has been applied.
+        """
+        coords_flipped = coords.clone()
+        coords_flipped[:, 0] = 1.0 - coords_flipped[:, 0]
+        coords_flipped[:, 2] = -coords_flipped[:, 2]
+        return coords_flipped
+
     @torch.no_grad()
     def _track_single_clip(self, clip_tensor: torch.Tensor) -> torch.Tensor:
         """
@@ -368,4 +484,13 @@ class CompositeBackbone(nn.Module):
         # x: (B, C, T, H, W)
         features = [b(x) for b in self.backbones]
         return torch.cat(features, dim=-1)  # (B, T, D_totale)
+
+    def forward_dual(self, x_norm: torch.Tensor, x_raw: torch.Tensor) -> torch.Tensor:
+        features = []
+        for b in self.backbones:
+            if isinstance(b, BallTrackerBackbone):
+                features.append(b(x_raw))
+            else:
+                features.append(b(x_norm))
+        return torch.cat(features, dim=-1)
 
