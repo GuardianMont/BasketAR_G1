@@ -16,7 +16,6 @@ from torch.utils.data import DataLoader
 
 
 _REQUIRED_BATCH_KEYS = {
-    "x",
     "labels",
     "lengths",
     "sample_ids",
@@ -33,7 +32,12 @@ def _validate_batch(batch: Dict[str, Any]) -> None:
             f"Missing: {sorted(missing)}."
         )
 
-    x = batch["x"]
+    if "x" in batch:
+        x = batch["x"]
+    elif "x_norm" in batch and "x_raw" in batch:
+        x = batch["x_norm"]
+    else:
+        raise KeyError("Batch must contain either 'x' or both 'x_norm' and 'x_raw'.")
 
     if not isinstance(x, torch.Tensor) or x.dim() != 5:
         raise ValueError(
@@ -151,7 +155,8 @@ def extract_features_offline(
 
         _validate_batch(batch)
 
-        videos = batch["x"]
+        is_dual = "x_norm" in batch and "x_raw" in batch
+        videos = batch["x"] if not is_dual else batch["x_norm"]
         labels = batch["labels"]
 
         lengths = torch.as_tensor(
@@ -194,20 +199,46 @@ def extract_features_offline(
                 as_tuple=False,
             ).flatten()
 
-            clip_group = videos[
-                sample_indices,
-                :,
-                :valid_length,
-                :,
-                :,
-            ].to(
-                device,
-                non_blocking=True,
-            )
-
-            group_features = backbone(
-                clip_group
-            )
+            if is_dual:
+                clip_group_norm = batch["x_norm"][
+                    sample_indices,
+                    :,
+                    :valid_length,
+                    :,
+                    :,
+                ].to(
+                    device,
+                    non_blocking=True,
+                )
+                clip_group_raw = batch["x_raw"][
+                    sample_indices,
+                    :,
+                    :valid_length,
+                    :,
+                    :,
+                ].to(
+                    device,
+                    non_blocking=True,
+                )
+                if hasattr(backbone, 'forward_dual'):
+                    group_features = backbone.forward_dual(clip_group_norm, clip_group_raw)
+                else:
+                    raise RuntimeError("Dual inputs provided but backbone lacks forward_dual()")
+            else:
+                clip_group = videos[
+                    sample_indices,
+                    :,
+                    :valid_length,
+                    :,
+                    :,
+                ].to(
+                    device,
+                    non_blocking=True,
+                )
+    
+                group_features = backbone(
+                    clip_group
+                )
 
             if group_features.dim() != 3:
                 raise RuntimeError(

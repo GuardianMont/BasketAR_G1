@@ -3,6 +3,8 @@ from torch.utils.data import Dataset
 from typing import List, Dict, Any, Optional, Callable
 
 
+phase_1_labels = {}
+
 class ActionRecognitionDataset(Dataset):
     """Generic dataset for Action Recognition classification on video clips or extracted features.
 
@@ -107,27 +109,42 @@ class ActionRecognitionDataset(Dataset):
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         item = self.samples[idx]
-        label = item["label"]
+        orig_label = item["label"]  # 0..8
         
-        # Simulated loading (in production load video via decord/PyAV or load .pt/.npz files)
-        data_source = item["data"]  # Can be a 5D/3D tensor or file path
+        # Lable mapping (-1 is for easy filtering)
+        # Phase 1: Action (0 = passaggio, 1 = tiro, 2 = idle/non-gioco)
+        if orig_label == 0:
+            label_p1 = 0
+        elif orig_label in [1, 2, 3, 4, 5, 6]:
+            label_p1 = 1
+        else:
+            label_p1 = 2
+
+        # Phase 2: Shot's type (0 = tiro da 2, 1 = tiro da 3, 2 = tiro libero, -1 = N/A)
+        if orig_label in [1, 2]:    label_p2 = 0
+        elif orig_label in [3, 4]:  label_p2 = 1
+        elif orig_label in [5, 6]:  label_p2 = 2
+        else:                       label_p2 = -1
+
+        # Phase 3: Shot's outcome (0 = sbagliato, 1 = segnato, -1 = N/A)
+        if orig_label in [1, 3, 5]:   label_p3 = 0
+        elif orig_label in [2, 4, 6]: label_p3 = 1 
+        else:                         label_p3 = -1 
+
+        data_source = item["data"]
         total_frames = item.get("num_frames", data_source.shape[0] if self.is_feature_dataset else data_source.shape[1])
 
         indices = self._get_sampled_indices(total_frames)
         valid_length = len(indices)
 
-        if self.is_feature_dataset:
-            # Pre-extracted 3D Features: Shape (T, D)
-            x = data_source[indices]
-        else:
-            # Raw 5D Video: Original Shape (C, T, H, W)
-            x = data_source[:, indices, :, :]
-            if self.spatial_transform is not None:
-                x = self.spatial_transform(x)
+        x = data_source[indices] if self.is_feature_dataset else data_source[:, indices, :, :]
 
         return {
             "data": x,
-            "label": label,
+            "label_orig": orig_label,
+            "label_p1": label_p1,     
+            "label_p2": label_p2,    
+            "label_p3": label_p3,    
             "length": valid_length,
             "sample_id": item.get("id", idx)
         }

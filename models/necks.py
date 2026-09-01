@@ -124,6 +124,8 @@ class TCNNeck(BaseTemporalNeck):
         out_dim = num_channels[-1]
         super().__init__(in_dim=in_dim, out_dim=out_dim)
 
+        self.input_norm = nn.LayerNorm(in_dim)
+
         layers = []
         num_levels = len(num_channels)
         for i in range(num_levels):
@@ -137,6 +139,7 @@ class TCNNeck(BaseTemporalNeck):
         self.network = nn.ModuleList(layers)
 
     def forward(self, x: torch.Tensor, lengths: Optional[torch.Tensor] = None) -> torch.Tensor:
+        x = self.input_norm(x)
         # PyTorch's Conv1D requires (B, Channels, Time)
         x_t = x.transpose(1, 2)
         
@@ -145,7 +148,11 @@ class TCNNeck(BaseTemporalNeck):
             max_len = x.size(1)
             # Make a padding mask: True = Sample, False = Padding
             # `None` index adds a single dimension. Used for broadcasting operations
-            mask = (torch.arange(max_len, device=x.device)[None, :] < lengths[:, None]).unsqueeze(1)
+            lengths_device = lengths.to(x.device)
+            mask = (
+                torch.arange(max_len, device=x.device)[None, :]
+                < lengths_device[:, None]
+            ).unsqueeze(1)
             x_t = x_t * mask
 
         for block in self.network:
