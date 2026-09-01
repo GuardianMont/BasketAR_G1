@@ -73,28 +73,16 @@ DEFAULT_GRID = {"lr": [1e-3]}
 # Dataset descriptions
 DATA_CONFIGS = {
     "DATA-01_Solo3D": (
-        "3D Spatio-Temporal Features (X3D-S)",
-        "features/train_3d.pt",
-        "features/val_3d.pt",
-        192,
+        "3D Spatio-Temporal Features (X3D-L)",
+        "features/train_3d_L.pt",
+        "features/val_3d_L.pt",
+        432,  # ex 192
     ),
     "DATA-02_3D_Tracker": (
-        "3D Features + Ball Tracking Geometry",
-        "features/train_3d_tracker.pt",
-        "features/val_3d_tracker.pt",
-        197,
-    ),
-    "DATA-03_3D_2D": (
-        "3D Features + 2D Spatial Features (ConvNeXt-Tiny)",
-        "features/train_3d_2d.pt",
-        "features/val_3d_2d.pt",
-        960,
-    ),
-    "DATA-04_Full_Hybrid": (
-        "Full Hybrid Representation (3D + 2D + Ball Tracker)",
-        "features/train_3d_2d_tracker.pt",
-        "features/val_3d_2d_tracker.pt",
-        965,
+        "3D Features (X3D-L) + Ball Tracking Geometry",
+        "features/train_3d_tracker_L.pt",
+        "features/val_3d_tracker_L.pt",
+        437,  # ex 197
     ),
 }
 
@@ -272,7 +260,8 @@ def train_single_phase(
                 model.parameters(), lr=params.get("lr", 1e-3)
             )
 
-            best_run_f1 = -1.0
+            best_run_loss = float("inf")
+            best_run_f1 = 0.0
             best_run_acc = 0.0
             best_run_epoch = 0
             epochs_without_improvement = 0
@@ -346,9 +335,16 @@ def train_single_phase(
                     "ValAcc": f"{acc:.4f}",
                     "ValF1": f"{macro_f1:.4f}",
                     "BestF1": f"{best_run_f1:.4f}" if best_run_f1 > 0 else "N/A",
+                    "BestLoss": (
+                        f"{best_run_loss:.4f}"
+                        if best_run_loss < float("inf")
+                        else "N/A"
+                    ),
                 })
 
-                if macro_f1 > best_run_f1:
+                # Early Stopping basato sulla minimizzazione della Validation Loss
+                if avg_val_loss < best_run_loss:
+                    best_run_loss = avg_val_loss
                     best_run_f1 = macro_f1
                     best_run_acc = acc
                     best_run_epoch = epoch
@@ -368,7 +364,8 @@ def train_single_phase(
                     if epochs_without_improvement >= patience:
                         epoch_pbar.write(
                             f"    [EARLY STOPPING - {phase.upper()}] Best Ep:"
-                            f" {best_run_epoch} | Best Macro-F1: {best_run_f1:.4f}"
+                            f" {best_run_epoch} | Best Val Loss:"
+                            f" {best_run_loss:.4f} (Val F1: {best_run_f1:.4f})"
                         )
                         break
 
