@@ -3,6 +3,7 @@ from .backbone import X3DSBackbone, ConvNeXt2DBackbone, BallTrackerBackbone, Com
 from .necks import IdentityNeck, TCNNeck, BiGRUNeck
 from .heads import MeanPoolingClassifierHead, AttentionClassifierHead
 from .pipeline import ARPipeline
+from .trainer import Trainer
 
 __all__ = [
     "BaseBackbone",
@@ -18,4 +19,5 @@ __all__ = [
     "MeanPoolingClassifierHead",
     "AttentionClassifierHead"
     "ARPipeline",
+    "Trainer"
 ]
