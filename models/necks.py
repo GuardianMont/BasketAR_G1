@@ -139,10 +139,6 @@ class TCNNeck(BaseTemporalNeck):
         self.network = nn.ModuleList(layers)
 
     def forward(self, x: torch.Tensor, lengths: Optional[torch.Tensor] = None) -> torch.Tensor:
-        x = self.input_norm(x)
-        # PyTorch's Conv1D requires (B, Channels, Time)
-        x_t = x.transpose(1, 2)
-        
         mask = None
         if lengths is not None:
             max_len = x.size(1)
@@ -153,7 +149,16 @@ class TCNNeck(BaseTemporalNeck):
                 torch.arange(max_len, device=x.device)[None, :]
                 < lengths_device[:, None]
             ).unsqueeze(1)
-            x_t = x_t * mask
+            # Mask before LayerNorm and again after it: LayerNorm has a
+            # learnable bias that can otherwise make padded steps non-zero.
+            x = x * mask.transpose(1, 2)
+
+        x = self.input_norm(x)
+        if mask is not None:
+            x = x * mask.transpose(1, 2)
+
+        # PyTorch's Conv1D requires (B, Channels, Time)
+        x_t = x.transpose(1, 2)
 
         for block in self.network:
             x_t = block(x_t)

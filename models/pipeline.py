@@ -30,7 +30,7 @@ class ARPipeline(nn.Module):
             features = x
 
         temporal_features = self.neck(features, lengths)
-        logits = self.head(temporal_features)
+        logits = self.head(temporal_features, lengths=lengths)
 
         return logits
 
