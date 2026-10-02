@@ -14,7 +14,6 @@ from utils.logger import ExperimentLogger
 from models.necks import IdentityNeck, BiGRUNeck, TCNNeck
 from models.heads import MeanPoolingClassifierHead, AttentionClassifierHead
 
-# [Gli esperimenti EXPERIMENTS restano definiti come prima...]
 EXPERIMENTS = {
     "EXP-01_Baseline_Identity": {
         "components": {

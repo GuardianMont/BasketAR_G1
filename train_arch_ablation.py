@@ -10,7 +10,6 @@ import pandas as pd
 import torch
 import torch.nn as nn
 
-# Refactored module imports
 from data.phase_manager import PHASE_CONFIGS, prepare_phase_data
 from models.trainer import Trainer
 from losses import FocalLoss
@@ -357,7 +356,6 @@ if __name__ == "__main__":
     )
     os.makedirs(suite_dir, exist_ok=True)
 
-    # Caricamento delle feature fisse DATA-02
     raw_train_samples = FeatureLoader.load(
         FIXED_DATA_CONFIG["train_path"],
         expected_dim=FIXED_DATA_CONFIG["feature_dim"],

@@ -9,7 +9,6 @@ import pandas as pd
 import torch
 import torch.nn as nn
 
-# Refactored module imports
 from data.phase_manager import PHASE_CONFIGS, prepare_phase_data
 from models.trainer import Trainer
 from models.heads import AttentionClassifierHead
@@ -264,12 +263,10 @@ if __name__ == "__main__":
                 num_runs=args.num_runs,
             )
 
-            # Salva i dettagli di tutte le run per la singola fase
             df_phase = pd.DataFrame(phase_results)
             phase_csv_path = os.path.join(csv_dir, f"results_{phase}_all_runs.csv")
             df_phase.to_csv(phase_csv_path, index=False)
 
-            # Calcolo statistiche aggregate (media +/- std)
             acc_mean = round(float(df_phase["val_accuracy"].mean()), 4)
             acc_std = round(float(df_phase["val_accuracy"].std()), 4)
             f1_mean = round(float(df_phase["val_macro_f1"].mean()), 4)
@@ -290,7 +287,6 @@ if __name__ == "__main__":
 
             exp_hierarchical_results.extend(phase_results)
 
-        # Salva CSV complessivo per l'esperimento
         exp_overall_csv = os.path.join(exp_dir, "overall_results.csv")
         pd.DataFrame(exp_hierarchical_results).to_csv(
             exp_overall_csv, index=False
@@ -298,7 +294,6 @@ if __name__ == "__main__":
 
         suite_all_results.extend(exp_hierarchical_results)
 
-    # Salva report completi della suite
     suite_summary_csv = os.path.join(suite_dir, "data_ablation_all_runs.csv")
     pd.DataFrame(suite_all_results).to_csv(suite_summary_csv, index=False)
 
