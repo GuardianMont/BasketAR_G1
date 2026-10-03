@@ -13,7 +13,9 @@ from tqdm import tqdm
 
 # Module imports
 from data.dataset import ActionRecognitionDataset
+from data.experiment_config import ExperimentConfig
 from data.samplers import BucketSampler
+from data.temporal_sampling import LegacyUniformSampler
 from data.utils import compute_class_weights, pad_and_collate_video_batch
 from losses import FocalLoss
 from models.heads import AttentionClassifierHead, MeanPoolingClassifierHead
@@ -71,17 +73,36 @@ DEFAULT_COMPONENTS = {
 DEFAULT_GRID = {"lr": [1e-3]}
 
 # Dataset descriptions
+BASELINE_FEATURE_CONFIG = ExperimentConfig(
+    sampler=LegacyUniformSampler(16).config(),
+    spatial_mode="letterbox",
+    spatial_size=312,
+    color="rgb",
+    backbone="x3d_l",
+    tracker="none",
+    extra={"transform": "none"},
+)
+TRACKER_FEATURE_CONFIG = ExperimentConfig(
+    sampler=LegacyUniformSampler(16).config(),
+    spatial_mode="letterbox",
+    spatial_size=312,
+    color="rgb",
+    backbone="x3d_l",
+    tracker="yolov8n_coco",
+    extra={"transform": "none"},
+)
+
 DATA_CONFIGS = {
     "DATA-01_Solo3D": (
         "3D Spatio-Temporal Features (X3D-L)",
-        "features/train_3d_L.pt",
-        "features/val_3d_L.pt",
+        os.path.join("features", BASELINE_FEATURE_CONFIG.feature_filename("train")),
+        os.path.join("features", BASELINE_FEATURE_CONFIG.feature_filename("val")),
         432,  # ex 192
     ),
     "DATA-02_3D_Tracker": (
         "3D Features (X3D-L) + Ball Tracking Geometry",
-        "features/train_3d_tracker_L.pt",
-        "features/val_3d_tracker_L.pt",
+        os.path.join("features", TRACKER_FEATURE_CONFIG.feature_filename("train")),
+        os.path.join("features", TRACKER_FEATURE_CONFIG.feature_filename("val")),
         437,  # ex 197
     ),
 }
@@ -100,47 +121,34 @@ EXPERIMENTS = {
 
 
 def load_preextracted_features(pt_file_path: str, expected_dim: int):
-    """Loads feature file or generates mock tensor data if missing."""
+    """Load and validate a real feature payload."""
     if not os.path.exists(pt_file_path):
-        print(
-            f"[WARNING] Feature file '{pt_file_path}' not found. Generating mock"
-            " features for testing..."
-        )
-        os.makedirs(os.path.dirname(pt_file_path), exist_ok=True)
-
-        num_samples = 12 if "train" in pt_file_path else 6
-        mock_samples = []
-
-        for i in range(num_samples):
-            T_i = int(torch.randint(8, 41, (1,)).item())
-            mock_samples.append({
-                "id": f"clip_{i:06d}",
-                "data": torch.randn(T_i, expected_dim),
-                "label": i % 9,
-                "num_frames": T_i,
-            })
-
-        mock_payload = {
-            "format_version": 1,
-            "backbone": "MockBackbone",
-            "feature_dim": expected_dim,
-            "num_samples": num_samples,
-            "samples": mock_samples,
-        }
-
-        torch.save(mock_payload, pt_file_path)
-        print(
-            f"[INFO] Created mock dataset at '{pt_file_path}' with"
-            f" {num_samples} samples (D={expected_dim})."
+        raise FileNotFoundError(
+            f"Feature file '{pt_file_path}' not found. Extract features before training."
         )
 
     payload = torch.load(pt_file_path, map_location="cpu", weights_only=False)
+    if not isinstance(payload, dict):
+        raise ValueError(f"Invalid feature payload in '{pt_file_path}': expected a dictionary.")
+    if payload.get("feature_dim") != expected_dim:
+        raise ValueError(
+            f"Expected feature dimension {expected_dim}, got "
+            f"{payload.get('feature_dim')} in '{pt_file_path}'."
+        )
     print(
         f"[INFO] Loaded {payload['num_samples']} samples (Dimension"
-        f" D={payload['feature_dim']}) from '{pt_file_path}'"
+        f" D={payload['feature_dim']}) from '{pt_file_path}' "
+        f"(metadata={payload.get('metadata', {})})"
     )
 
-    return payload["samples"]
+    samples = payload.get("samples")
+    if not isinstance(samples, list) or not samples:
+        raise ValueError(f"Invalid or empty feature payload: '{pt_file_path}'")
+    for index, sample in enumerate(samples):
+        data = sample.get("data")
+        if not torch.is_tensor(data) or data.ndim != 2 or data.shape[1] != expected_dim:
+            raise ValueError(f"Invalid feature tensor in sample {index} of '{pt_file_path}'.")
+    return samples
 
 
 def build_dataloaders_for_phase(train_samples, val_samples, phase: str):
@@ -168,7 +176,7 @@ def build_dataloaders_for_phase(train_samples, val_samples, phase: str):
     train_loader = DataLoader(
         train_dataset,
         batch_sampler=BucketSampler(
-            sequence_lengths=[s["num_frames"] for s in train_filtered],
+            sequence_lengths=[int(s["data"].shape[0]) for s in train_filtered],
             batch_size=8,
         ),
         collate_fn=pad_and_collate_video_batch,
