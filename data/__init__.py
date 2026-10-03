@@ -7,8 +7,14 @@ from .temporal_sampling import (
     PreserveAllSampler,
     FixedFPSSampler,
     FirstLastSampler,
+    build_temporal_sampler,
 )
-from .transforms import VideoRandomHorizontalFlip, VideoColorJitter, RandomTemporalShift, VideoHorizontalFlip
+from .transforms import (
+    VideoHorizontalFlip,
+    VideoRandomHorizontalFlip,
+    VideoColorJitter,
+    RandomTemporalShift,
+)
 from .utils import pad_and_collate_video_batch, compute_class_weights
 
 __all__ = [
@@ -22,6 +28,7 @@ __all__ = [
     "PreserveAllSampler",
     "FixedFPSSampler",
     "FirstLastSampler",
+    "build_temporal_sampler",
     "VideoRandomHorizontalFlip",
     "VideoColorJitter",
     "RandomTemporalShift",

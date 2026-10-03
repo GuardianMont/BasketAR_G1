@@ -92,6 +92,11 @@ class ActionRecognitionDataset(Dataset):
 
         if temporal_sampler is not None:
             self.temporal_sampler = temporal_sampler
+        elif is_feature_dataset and sampling_strategy is not None:
+            raise ValueError(
+                "Pre-extracted features must keep their stored temporal steps. "
+                "Pass an explicit temporal_sampler only when resampling is intentional."
+            )
         elif sampling_strategy == "fixed_fps":
             self.temporal_sampler = FixedFPSSampler(target_fps)
         elif sampling_strategy in (None, "uniform"):
