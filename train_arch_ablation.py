@@ -4,10 +4,14 @@ import os
 import random
 import sys
 from datetime import datetime
+
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
+
+from data.phase_manager import PHASE_CONFIGS, prepare_phase_data
+from models.trainer import Trainer
 from sklearn.metrics import accuracy_score, f1_score
 from torch.utils.data import DataLoader
 from tqdm import tqdm
@@ -22,6 +26,7 @@ from losses import FocalLoss
 from models.heads import AttentionClassifierHead, MeanPoolingClassifierHead
 from models.necks import BiGRUNeck, IdentityNeck, TCNNeck
 from models.pipeline import ARPipeline
+from utils.feature_loader import FeatureLoader
 from utils.logger import ExperimentLogger
 from utils.plotting import (
     CLASS_NAMES,
@@ -47,26 +52,6 @@ FIXED_DATA_CONFIG = {
     "feature_dim": 432,
 }
 
-# Configurazione per le 3 fasi gerarchiche
-PHASE_CONFIGS = {
-    "p1": {
-        "name": "p1 (Action Type)",
-        "num_classes": 3,
-        "filter_shots_only": False,
-    },
-    "p2": {
-        "name": "p2 (Shot Type)",
-        "num_classes": 3,
-        "filter_shots_only": True,
-    },
-    "p3": {
-        "name": "p3 (Shot Outcome)",
-        "num_classes": 2,
-        "filter_shots_only": True,
-    },
-}
-
-# EXPERIMENTS CONFIGURATION PER ARCHITECTURE & LOSS ABLATION
 EXPERIMENTS = {
     "ARCH-01_Identity_Mean": {
         "description": "Identity Neck + Mean Pooling Head (Temporal Baseline)",
@@ -160,7 +145,7 @@ EXPERIMENTS = {
                 in_dim=in_dim, num_classes=num_classes, dropout=0.0
             ),
             "loss": lambda params, weights: FocalLoss(
-                gamma=params['gamma'], alpha=weights
+                gamma=params["gamma"], alpha=weights
             ),
         },
         "grid": {
@@ -169,6 +154,7 @@ EXPERIMENTS = {
         },
     },
 }
+
 
 def set_seed(seed: int):
     """Sets random seeds for reproducible experiments."""
@@ -265,15 +251,14 @@ def train_single_phase(
     experiment_name: str,
     exp_dir: str,
     config: dict,
-    train_loader: DataLoader,
-    val_loader: DataLoader,
-    class_weights: torch.Tensor,
+    train_samples: list[dict],
+    val_samples: list[dict],
     device: torch.device,
     epochs: int,
     patience: int,
     num_runs: int = 5,
     base_seed: int = 42,
-):
+) -> list[dict]:
     p_cfg = PHASE_CONFIGS[phase]
     num_classes = p_cfg["num_classes"]
     feature_dim = FIXED_DATA_CONFIG["feature_dim"]
@@ -291,6 +276,10 @@ def train_single_phase(
     )
     print(f"{'='*70}")
 
+    train_loader, val_loader, class_weights = prepare_phase_data(
+        train_samples, val_samples, phase=phase
+    )
+
     keys, values = zip(*config["grid"].items())
     combinations = [dict(zip(keys, v)) for v in itertools.product(*values)]
 
@@ -300,7 +289,7 @@ def train_single_phase(
         seed = base_seed + run_idx
         set_seed(seed)
 
-        for combo_idx, params in enumerate(combinations):
+        for combo_idx, params in enumerate(combinations, 1):
             print(
                 f"\n--> [{phase.upper()} | Run {run_idx}/{num_runs} | Seed {seed}]"
                 f" Config: {params}"
@@ -309,152 +298,52 @@ def train_single_phase(
             tb_logger = ExperimentLogger(
                 log_dir=os.path.join(phase_dir, "tb_runs"),
                 experiment_name=f"{experiment_name}_run{run_idx}",
-                run_id=combo_idx + 1,
+                run_id=combo_idx,
             )
 
             neck = config["components"]["neck"](params, in_dim=feature_dim)
             head = config["components"]["head"](
                 params,
-                in_dim=neck.out_dim if hasattr(neck, "out_dim") else feature_dim,
+                in_dim=getattr(neck, "out_dim", feature_dim),
                 num_classes=num_classes,
             )
             criterion = config["components"]["loss"](
                 params, class_weights.to(device)
             )
 
-            model = ARPipeline(backbone=None, neck=neck, head=head).to(device)
+            model = ARPipeline(backbone=None, neck=neck, head=head)
             optimizer = torch.optim.Adam(
-                model.parameters(), lr=params.get("lr", 1e-3), weight_decay=params.get("weight_decay", 0.0)
+                model.parameters(),
+                lr=params.get("lr", 1e-3),
+                weight_decay=params.get("weight_decay", 0.0),
             )
 
-            best_run_loss = float("inf")
-            best_run_f1 = 0.0
-            best_run_acc = 0.0
-            best_run_epoch = 0
-            epochs_without_improvement = 0
+            checkpoint_path = os.path.join(
+                checkpoints_dir,
+                f"{experiment_name}_run{run_idx}_{phase}_best.pt",
+            )
+            plot_path = os.path.join(
+                plots_dir, f"{experiment_name}_run{run_idx}_{phase}_cm.png"
+            )
 
-            best_preds, best_labels = [], []
-            label_key = f"label_{phase}"
+            trainer = Trainer(
+                model=model,
+                optimizer=optimizer,
+                criterion=criterion,
+                device=device,
+            )
 
-            epoch_pbar = tqdm(
-                range(1, epochs + 1),
+            metrics = trainer.fit(
+                train_loader=train_loader,
+                val_loader=val_loader,
+                phase=phase,
+                epochs=epochs,
+                patience=patience,
+                tb_logger=tb_logger,
+                checkpoint_path=checkpoint_path,
+                plot_path=plot_path,
                 desc=f"[{phase.upper()} | Run {run_idx}/{num_runs}]",
-                unit="ep",
-                leave=True,
             )
-
-            for epoch in epoch_pbar:
-                # --- TRAINING ---
-                model.train()
-                train_loss = 0.0
-
-                for batch in train_loader:
-                    x = batch["x"].to(device)
-                    labels = batch[label_key].to(device)
-                    lengths = batch["lengths"]
-
-                    optimizer.zero_grad()
-                    logits = model(x, lengths=lengths)
-                    loss = criterion(logits, labels)
-
-                    loss.backward()
-                    optimizer.step()
-
-                    train_loss += loss.item()
-
-                # --- VALIDATION ---
-                model.eval()
-                all_preds, all_labels = [], []
-                val_loss = 0.0
-
-                with torch.no_grad():
-                    for batch in val_loader:
-                        x = batch["x"].to(device)
-                        labels = batch[label_key].to(device)
-                        lengths = batch["lengths"]
-
-                        logits = model(x, lengths=lengths)
-                        loss = criterion(logits, labels)
-                        val_loss += loss.item()
-
-                        preds = torch.argmax(logits, dim=1)
-                        all_preds.extend(preds.cpu().numpy())
-                        all_labels.extend(labels.cpu().numpy())
-
-                acc = accuracy_score(all_labels, all_preds)
-                macro_f1 = f1_score(
-                    all_labels, all_preds, average="macro", zero_division=0
-                )
-                avg_train_loss = train_loss / len(train_loader)
-                avg_val_loss = val_loss / len(val_loader)
-
-                tb_logger.log_epoch(
-                    epoch=epoch,
-                    train_loss=avg_train_loss,
-                    val_loss=avg_val_loss,
-                    val_acc=acc,
-                    val_f1=macro_f1,
-                )
-                epoch_pbar.set_postfix({
-                    "TrLoss": f"{avg_train_loss:.4f}",
-                    "ValLoss": f"{avg_val_loss:.4f}",
-                    "ValAcc": f"{acc:.4f}",
-                    "ValF1": f"{macro_f1:.4f}",
-                    "BestF1": f"{best_run_f1:.4f}" if best_run_f1 > 0 else "N/A",
-                    "BestLoss": (
-                        f"{best_run_loss:.4f}"
-                        if best_run_loss < float("inf")
-                        else "N/A"
-                    ),
-                })
-
-                # Early Stopping basato sulla minimizzazione della Validation Loss
-                if avg_val_loss < best_run_loss:
-                    best_run_loss = avg_val_loss
-                    best_run_f1 = macro_f1
-                    best_run_acc = acc
-                    best_run_epoch = epoch
-                    epochs_without_improvement = 0
-
-                    best_preds = all_preds
-                    best_labels = all_labels
-
-                    weight_path = os.path.join(
-                        checkpoints_dir,
-                        f"{experiment_name}_run{run_idx}_{phase}_best.pt",
-                    )
-                    torch.save(model.state_dict(), weight_path)
-                else:
-                    epochs_without_improvement += 1
-
-                    if epochs_without_improvement >= patience:
-                        epoch_pbar.write(
-                            f"    [EARLY STOPPING - {phase.upper()}] Best Ep:"
-                            f" {best_run_epoch} | Best Val Loss:"
-                            f" {best_run_loss:.4f} (Val F1: {best_run_f1:.4f})"
-                        )
-                        break
-
-            if best_preds and best_labels:
-                plot_path = os.path.join(
-                    plots_dir, f"{experiment_name}_run{run_idx}_{phase}_cm.png"
-                )
-                phase_class_names = PHASE_CLASS_NAMES.get(phase, CLASS_NAMES)
-
-                save_confusion_matrix_plot(
-                    best_labels,
-                    best_preds,
-                    plot_path,
-                    class_names=phase_class_names,
-                )
-                cm_tensor = get_confusion_matrix_tensor(
-                    best_labels, best_preds, class_names=phase_class_names
-                )
-                tb_logger.log_image(
-                    f"Confusion_Matrix/{phase.upper()}_Best",
-                    cm_tensor,
-                    step=best_run_epoch,
-                )
 
             tb_logger.close()
 
@@ -465,16 +354,9 @@ def train_single_phase(
                 "run_id": run_idx,
                 "seed": seed,
                 "hyperparameters": str(params),
-                "best_epoch": best_run_epoch,
-                "val_accuracy": round(best_run_acc, 4),
-                "val_macro_f1": round(best_run_f1, 4),
-                "checkpoint_path": os.path.join(
-                    checkpoints_dir,
-                    f"{experiment_name}_run{run_idx}_{phase}_best.pt",
-                ),
-                "confusion_matrix_path": os.path.join(
-                    plots_dir, f"{experiment_name}_run{run_idx}_{phase}_cm.png"
-                ),
+                "checkpoint_path": checkpoint_path,
+                "confusion_matrix_path": plot_path,
+                **metrics,
             }
             phase_results.append(run_record)
 
@@ -572,7 +454,6 @@ if __name__ == "__main__":
 
     target_phases = [args.phase] if args.phase else ["p1", "p2", "p3"]
 
-    # Costruzione dinamica del nome cartella di report
     exp_name_str = args.experiment if args.experiment else "ALL_EXP"
     phase_str = args.phase if args.phase else "ALL_PHASES"
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -582,12 +463,13 @@ if __name__ == "__main__":
     )
     os.makedirs(suite_dir, exist_ok=True)
 
-    # Caricamento delle feature X3D-L senza tracker (D=432)
-    raw_train_samples = load_preextracted_features(
-        FIXED_DATA_CONFIG["train_path"], expected_dim=FIXED_DATA_CONFIG["feature_dim"]
+    raw_train_samples = FeatureLoader.load(
+        FIXED_DATA_CONFIG["train_path"],
+        expected_dim=FIXED_DATA_CONFIG["feature_dim"],
     )
-    raw_val_samples = load_preextracted_features(
-        FIXED_DATA_CONFIG["val_path"], expected_dim=FIXED_DATA_CONFIG["feature_dim"]
+    raw_val_samples = FeatureLoader.load(
+        FIXED_DATA_CONFIG["val_path"],
+        expected_dim=FIXED_DATA_CONFIG["feature_dim"],
     )
 
     suite_all_results = []
@@ -609,20 +491,13 @@ if __name__ == "__main__":
         exp_hierarchical_results = []
 
         for phase in target_phases:
-            train_loader, val_loader, class_weights = (
-                build_dataloaders_for_phase(
-                    raw_train_samples, raw_val_samples, phase=phase
-                )
-            )
-
             phase_results = train_single_phase(
                 phase=phase,
                 experiment_name=exp_name,
                 exp_dir=exp_dir,
                 config=config,
-                train_loader=train_loader,
-                val_loader=val_loader,
-                class_weights=class_weights,
+                train_samples=raw_train_samples,
+                val_samples=raw_val_samples,
                 device=device,
                 epochs=args.epochs,
                 patience=args.patience,
@@ -642,7 +517,10 @@ if __name__ == "__main__":
                 "std_val_macro_f1": best_config_info["std_val_macro_f1"],
                 "mean_val_accuracy": best_config_info["mean_val_accuracy"],
                 "std_val_accuracy": best_config_info["std_val_accuracy"],
-                "macro_f1_formatted": f"{best_config_info['mean_val_macro_f1']:.4f} +/- {best_config_info['std_val_macro_f1']:.4f}",
+                "macro_f1_formatted": (
+                    f"{best_config_info['mean_val_macro_f1']:.4f} +/-"
+                    f" {best_config_info['std_val_macro_f1']:.4f}"
+                ),
             })
 
             acc_mean = round(float(df_phase["val_accuracy"].mean()), 4)
@@ -670,20 +548,26 @@ if __name__ == "__main__":
             exp_overall_csv, index=False
         )
 
-        exp_best_cfg_csv = os.path.join(exp_dir, "best_configurations_per_phase.csv")
-        pd.DataFrame([b for b in best_config_summary if b["experiment_name"] == exp_name]).to_csv(
-            exp_best_cfg_csv, index=False
+        exp_best_cfg_csv = os.path.join(
+            exp_dir, "best_configurations_per_phase.csv"
         )
+        pd.DataFrame([
+            b for b in best_config_summary if b["experiment_name"] == exp_name
+        ]).to_csv(exp_best_cfg_csv, index=False)
 
         suite_all_results.extend(exp_hierarchical_results)
 
     suite_summary_csv = os.path.join(suite_dir, "arch_ablation_all_runs.csv")
     pd.DataFrame(suite_all_results).to_csv(suite_summary_csv, index=False)
 
-    suite_stats_csv = os.path.join(suite_dir, "arch_ablation_aggregated_stats.csv")
+    suite_stats_csv = os.path.join(
+        suite_dir, "arch_ablation_aggregated_stats.csv"
+    )
     pd.DataFrame(summary_stats).to_csv(suite_stats_csv, index=False)
 
-    suite_best_cfg_csv = os.path.join(suite_dir, "best_configurations_per_phase_all_experiments.csv")
+    suite_best_cfg_csv = os.path.join(
+        suite_dir, "best_configurations_per_phase_all_experiments.csv"
+    )
     df_best_cfg = pd.DataFrame(best_config_summary)
     df_best_cfg.to_csv(suite_best_cfg_csv, index=False)
 
