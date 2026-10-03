@@ -76,6 +76,7 @@ def extract_features_offline(
     output_path: str | Path,
     device: Optional[torch.device | str] = None,
     overwrite: bool = False,
+    metadata: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
     Extract temporal features for every clip in a DataLoader.
@@ -348,6 +349,7 @@ def extract_features_offline(
         "format_version": 1,
         "backbone": backbone.__class__.__name__,
         "feature_dim": feature_dim,
+        "metadata": metadata or {},
         "num_samples": len(
             extracted_samples
         ),

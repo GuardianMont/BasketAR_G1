@@ -11,7 +11,13 @@ import torchvision.transforms.functional as F
 from torch.utils.data import DataLoader, Dataset
 
 from data import RandomTemporalShift, VideoHorizontalFlip
+from data.experiment_config import ExperimentConfig
 from data.utils import pad_and_collate_video_batch
+from data.temporal_sampling import (
+    LegacyUniformSampler,
+    TemporalSampler,
+    build_temporal_sampler,
+)
 from models import (
     BallTrackerBackbone,
     CompositeBackbone,
@@ -47,6 +53,9 @@ class ManifestVideoDataset(Dataset):
         target_size=312,
         limit=None,
         transform=None,
+        temporal_sampler: TemporalSampler | None = None,
+        spatial_mode="letterbox",
+        color_mode="rgb",
     ):
         self.root = Path(root)
         self.transform = transform
@@ -67,28 +76,16 @@ class ManifestVideoDataset(Dataset):
         self.rows = df.to_dict("records")
         self.num_frames = num_frames
         self.target_size = target_size
+        self.temporal_sampler = temporal_sampler or LegacyUniformSampler(num_frames)
+        if spatial_mode not in {"letterbox", "stretch"}:
+            raise ValueError(f"Unsupported spatial mode: {spatial_mode}")
+        if color_mode not in {"rgb", "grayscale"}:
+            raise ValueError(f"Unsupported color mode: {color_mode}")
+        self.spatial_mode = spatial_mode
+        self.color_mode = color_mode
 
     def __len__(self):
         return len(self.rows)
-
-    def _uniform_indices(self, total_frames):
-        if total_frames <= 0:
-            raise ValueError("Video has no frames")
-
-        if total_frames >= self.num_frames:
-            stride = total_frames / float(self.num_frames)
-            return [
-                min(int(i * stride), total_frames - 1)
-                for i in range(self.num_frames)
-            ]
-
-        indices = list(range(total_frames))
-        indices.extend([total_frames - 1] * (self.num_frames - total_frames))
-
-        if isinstance(self.transform, RandomTemporalShift):
-            indices = self.transform(indices, total_frames)
-
-        return indices
 
     def _preprocess_frame(self, frame):
         array = frame.to_ndarray(format="rgb24")
@@ -101,22 +98,27 @@ class ManifestVideoDataset(Dataset):
         )
 
         _, h, w = x.shape
-        if h > w:
-            new_h, new_w = self.target_size, int(w * (self.target_size / h))
+        if self.spatial_mode == "stretch":
+            x_raw = F.resize(x, [self.target_size, self.target_size], antialias=True)
         else:
-            new_h, new_w = int(h * (self.target_size / w)), self.target_size
+            if h > w:
+                new_h, new_w = self.target_size, int(w * (self.target_size / h))
+            else:
+                new_h, new_w = int(h * (self.target_size / w)), self.target_size
 
-        x = F.resize(x, [new_h, new_w], antialias=True)
+            x = F.resize(x, [new_h, new_w], antialias=True)
+            pad_h = self.target_size - new_h
+            pad_w = self.target_size - new_w
+            padding = [
+                pad_w // 2,
+                pad_h // 2,
+                pad_w - pad_w // 2,
+                pad_h - pad_h // 2,
+            ]
+            x_raw = F.pad(x, padding, fill=0)
 
-        pad_h = self.target_size - new_h
-        pad_w = self.target_size - new_w
-        padding = [
-            pad_w // 2,
-            pad_h // 2,
-            pad_w - pad_w // 2,
-            pad_h - pad_h // 2,
-        ]
-        x_raw = F.pad(x, padding, fill=0)
+        if self.color_mode == "grayscale":
+            x_raw = F.rgb_to_grayscale(x_raw, num_output_channels=3)
 
         x_norm = F.normalize(x_raw, mean=X3D_MEAN, std=X3D_STD)
         return x_norm, x_raw
@@ -125,12 +127,15 @@ class ManifestVideoDataset(Dataset):
         with av.open(str(path)) as container:
             stream = container.streams.video[0]
             total_frames = int(stream.frames or 0)
+            fps = float(stream.average_rate) if stream.average_rate else None
 
         if total_frames <= 0:
             with av.open(str(path)) as container:
                 total_frames = sum(1 for _ in container.decode(video=0))
 
-        indices = self._uniform_indices(total_frames)
+        indices = self.temporal_sampler.sample_indices(total_frames, fps=fps)
+        if isinstance(self.transform, RandomTemporalShift):
+            indices = self.transform(indices, total_frames)
         wanted = set(indices)
         decoded_norm = {}
         decoded_raw = {}
@@ -251,6 +256,21 @@ def extract_all_configurations(args):
     else:
         transform = None
 
+    if args.temporal_sampler == "legacy_uniform":
+        sampler_config = {"name": args.temporal_sampler, "num_frames": args.num_frames}
+    elif args.temporal_sampler == "uniform":
+        sampler_config = {"name": args.temporal_sampler, "num_frames": args.num_frames}
+    elif args.temporal_sampler == "fixed_fps":
+        sampler_config = {"name": args.temporal_sampler, "target_fps": args.target_fps}
+    elif args.temporal_sampler == "first_last":
+        sampler_config = {
+            "name": args.temporal_sampler,
+            "frames_per_side": args.frames_per_side,
+        }
+    else:
+        raise ValueError(f"Unsupported temporal sampler: {args.temporal_sampler}")
+    temporal_sampler = build_temporal_sampler(sampler_config)
+
     dataset = ManifestVideoDataset(
         root=args.dataset_root,
         split=args.split,
@@ -258,6 +278,9 @@ def extract_all_configurations(args):
         target_size=target_size,
         limit=args.limit,
         transform=transform,
+        temporal_sampler=temporal_sampler,
+        spatial_mode=args.spatial_mode,
+        color_mode=args.color,
     )
 
     loader = DataLoader(
@@ -270,19 +293,33 @@ def extract_all_configurations(args):
         collate_fn=pad_and_collate_video_batch,
     )
 
-    configs_to_run = [
-        "3d",
-        "3d_tracker",
-    ]
+    if args.feature_stream == "all":
+        configs_to_run = ["3d", "3d_tracker"]
+    elif args.feature_stream == "3d":
+        configs_to_run = ["3d"]
+    else:
+        configs_to_run = ["3d_tracker"]
 
     for idx, cfg in enumerate(configs_to_run, 1):
-        backbone, filename = build_backbone_and_filename(
+        backbone, _ = build_backbone_and_filename(
             config_type=cfg,
             backbone_type=args.backbone_type,
             tracker_model_path=args.tracker_model_path,
         )
 
-        output_path = output_dir / f"{args.split}_{filename}"
+        experiment_config = ExperimentConfig(
+            sampler=temporal_sampler.config(),
+            spatial_mode=args.spatial_mode,
+            spatial_size=target_size,
+            color=args.color,
+            backbone=args.backbone_type.lower().replace("-", "_"),
+            tracker="yolov8n_coco" if "tracker" in cfg else "none",
+            extra={
+                "transform": args.transform,
+                **({"limit": args.limit} if args.limit is not None else {}),
+            },
+        )
+        output_path = output_dir / experiment_config.feature_filename(args.split)
 
         print(
             f"\n[{idx}/{len(configs_to_run)}] Estrazione Configurazione:"
@@ -295,6 +332,11 @@ def extract_all_configurations(args):
             output_path=str(output_path),
             device="cuda" if torch.cuda.is_available() else "cpu",
             overwrite=args.overwrite,
+            metadata={
+                "split": args.split,
+                "experiment_config": experiment_config.to_dict(),
+                "experiment_id": experiment_config.feature_id(),
+            },
         )
 
         print(
@@ -308,7 +350,7 @@ def main():
         description="Offline Feature Extraction Suite per Basket Action Recognition."
     )
 
-    parser.add_argument("--dataset-root", default="dataset/dataset_hd")
+    parser.add_argument("--dataset-root", default="dataset_hd")
     parser.add_argument(
         "--split", choices=["train", "val", "test"], required=True
     )
@@ -334,6 +376,23 @@ def main():
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--num-frames", type=int, default=16)
+    parser.add_argument(
+        "--temporal-sampler",
+        choices=["legacy_uniform", "uniform", "fixed_fps", "first_last"],
+        default="legacy_uniform",
+    )
+    parser.add_argument("--target-fps", type=float, default=15.0)
+    parser.add_argument("--frames-per-side", type=int, default=8)
+    parser.add_argument(
+        "--spatial-mode", choices=["letterbox", "stretch"], default="letterbox"
+    )
+    parser.add_argument("--color", choices=["rgb", "grayscale"], default="rgb")
+    parser.add_argument(
+        "--feature-stream",
+        choices=["3d", "3d_tracker", "all"],
+        default="all",
+        help="Fase 1 baseline usa '3d' (X3D-L senza tracker).",
+    )
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--overwrite", action="store_true")
 
