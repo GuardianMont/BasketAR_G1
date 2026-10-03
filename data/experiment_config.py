@@ -52,6 +52,11 @@ class ExperimentConfig:
             sampler_label = f"firstlast{k}x2"
         elif sampler_name == "fixed_fps":
             sampler_label = f"fixedfps{self.sampler.get('target_fps', 'unknown')}"
+        elif sampler_name == "edge_dense":
+            num_frames = self.sampler.get("num_frames", 16)
+            edge_strength = float(self.sampler.get("edge_strength", 1.0))
+            strength_percent = round(edge_strength * 100)
+            sampler_label = f"edgedense{num_frames}s{strength_percent}"
         else:
             sampler_label = sampler_name
 

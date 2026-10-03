@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from inspect import Parameter, signature
 from pathlib import Path
 
 import av
@@ -15,6 +16,7 @@ from data.experiment_config import ExperimentConfig
 from data.utils import pad_and_collate_video_batch
 from data.temporal_sampling import (
     LegacyUniformSampler,
+    SAMPLER_REGISTRY,
     TemporalSampler,
     build_temporal_sampler,
 )
@@ -59,6 +61,18 @@ class ManifestVideoDataset(Dataset):
     ):
         self.root = Path(root)
         self.transform = transform
+        self.num_frames = num_frames
+        self.target_size = target_size
+        self.temporal_sampler = temporal_sampler or LegacyUniformSampler(num_frames)
+        sampler_name = self.temporal_sampler.config().get("name")
+        if isinstance(transform, RandomTemporalShift) and sampler_name in {
+            "first_last",
+            "edge_dense",
+        }:
+            raise ValueError(
+                "RandomTemporalShift cannot be combined with the "
+                f"'{sampler_name}' sampler because it moves the selected endpoints."
+            )
 
         df = pd.read_csv(self.root / "manifest.csv")
         df = df[df["split"] == split].reset_index(drop=True)
@@ -74,9 +88,6 @@ class ManifestVideoDataset(Dataset):
             raise ValueError(f"Unknown labels: {unknown}")
 
         self.rows = df.to_dict("records")
-        self.num_frames = num_frames
-        self.target_size = target_size
-        self.temporal_sampler = temporal_sampler or LegacyUniformSampler(num_frames)
         if spatial_mode not in {"letterbox", "stretch"}:
             raise ValueError(f"Unsupported spatial mode: {spatial_mode}")
         if color_mode not in {"rgb", "grayscale"}:
@@ -256,19 +267,23 @@ def extract_all_configurations(args):
     else:
         transform = None
 
-    if args.temporal_sampler == "legacy_uniform":
-        sampler_config = {"name": args.temporal_sampler, "num_frames": args.num_frames}
-    elif args.temporal_sampler == "uniform":
-        sampler_config = {"name": args.temporal_sampler, "num_frames": args.num_frames}
-    elif args.temporal_sampler == "fixed_fps":
-        sampler_config = {"name": args.temporal_sampler, "target_fps": args.target_fps}
-    elif args.temporal_sampler == "first_last":
-        sampler_config = {
-            "name": args.temporal_sampler,
-            "frames_per_side": args.frames_per_side,
+    sampler_class = SAMPLER_REGISTRY.get(args.temporal_sampler)
+    if sampler_class is None:
+        available = ", ".join(sorted(SAMPLER_REGISTRY))
+        raise ValueError(
+            f"Unknown temporal sampler '{args.temporal_sampler}'. Available: {available}."
+        )
+    sampler_parameters = signature(sampler_class.__init__).parameters
+    sampler_config = {"name": args.temporal_sampler}
+    sampler_config.update(
+        {
+            name: getattr(args, name)
+            for name, parameter in sampler_parameters.items()
+            if name != "self"
+            and parameter.kind not in (Parameter.VAR_POSITIONAL, Parameter.VAR_KEYWORD)
+            and hasattr(args, name)
         }
-    else:
-        raise ValueError(f"Unsupported temporal sampler: {args.temporal_sampler}")
+    )
     temporal_sampler = build_temporal_sampler(sampler_config)
 
     dataset = ManifestVideoDataset(
@@ -378,11 +393,12 @@ def main():
     parser.add_argument("--num-frames", type=int, default=16)
     parser.add_argument(
         "--temporal-sampler",
-        choices=["legacy_uniform", "uniform", "fixed_fps", "first_last"],
+        choices=["legacy_uniform", "uniform", "fixed_fps", "first_last", "edge_dense"],
         default="legacy_uniform",
     )
     parser.add_argument("--target-fps", type=float, default=15.0)
     parser.add_argument("--frames-per-side", type=int, default=8)
+    parser.add_argument("--edge-strength", type=float, default=1.0)
     parser.add_argument(
         "--spatial-mode", choices=["letterbox", "stretch"], default="letterbox"
     )
