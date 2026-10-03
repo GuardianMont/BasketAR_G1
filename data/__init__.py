@@ -7,6 +7,9 @@ from .temporal_sampling import (
     PreserveAllSampler,
     FixedFPSSampler,
     FirstLastSampler,
+    EdgeDenseSampler,
+    SAMPLER_REGISTRY,
+    register_sampler,
     build_temporal_sampler,
 )
 from .transforms import (
@@ -28,6 +31,9 @@ __all__ = [
     "PreserveAllSampler",
     "FixedFPSSampler",
     "FirstLastSampler",
+    "EdgeDenseSampler",
+    "SAMPLER_REGISTRY",
+    "register_sampler",
     "build_temporal_sampler",
     "VideoRandomHorizontalFlip",
     "VideoColorJitter",
