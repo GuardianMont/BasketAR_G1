@@ -5,6 +5,10 @@ from typing import Optional
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+from torchvision.models import resnet50, ResNet50_Weights
+from torchvision.models.resnet import Bottleneck
+from torchvision.models.video import swin3d_t, Swin3D_T_Weights
 
 from .base import BaseBackbone
 
@@ -194,7 +198,7 @@ class X3DLBackbone(BaseBackbone):
         # 1. Trunk (Stage 0 -> Stage 4)
         self.trunk = nn.Sequential(*list(model.blocks[:-1]))
         
-        # 2. Estraggiamo i sotto-layer della Head che proiettano 192 -> 432
+        # 2. Extract the head sub-layers that project 192 -> 432
         head_pool = model.blocks[5].pool
         self.head_proj = nn.Sequential(
             head_pool.pre_conv,
@@ -216,7 +220,7 @@ class X3DLBackbone(BaseBackbone):
         x_feat = self.trunk(x)             # (B, 192, 16, 10, 10)
         x_feat = self.head_proj(x_feat)     # (B, 432, 16, 10, 10)
         
-        # Spatial Average Pooling solo su H' e W' -> preserva T=16
+        # Spatial Average Pooling only over H' and W' -> preserves T=16
         x_feat = x_feat.mean(dim=(-2, -1))  # (B, 432, 16)
         x_feat = x_feat.permute(0, 2, 1).contiguous() # (B, 16, 432)
 
@@ -345,9 +349,9 @@ import numpy as np
 
 class BallTrackerBackbone(nn.Module):
     """
-    Estrattore di feature geometriche della palla per sequenze video.
-    Utilizza la rete YOLOv8n (COCO) in inferenza pura via AutoBackend,
-    prevenendo al 100% l'attivazione dell'engine Trainer.
+    Geometric ball feature extractor for video sequences.
+    Uses the YOLOv8n (COCO) network in pure inference via AutoBackend,
+    100% preventing the activation of the Trainer engine.
     """
 
     def __init__(
@@ -359,24 +363,24 @@ class BallTrackerBackbone(nn.Module):
         super().__init__()
         from ultralytics.nn.autobackend import AutoBackend
 
-        # Carichiamo l'AutoBackend nativo: e' un modulo PyTorch puro senza logica di training
+        # Load native AutoBackend: it is a pure PyTorch module without training logic
         self.device = torch.device(device)
         self.model = AutoBackend(model=model_path, device=self.device)
         self.model.eval()
 
-        # Congeliamo tutti i parametri
+        # Freeze all parameters
         for param in self.model.parameters():
             param.requires_grad = False
 
         self.conf_thresh = confidence_threshold
-        self.ball_class_id = 32  # ID per 'sports ball' in COCO
+        self.ball_class_id = 32  # ID for 'sports ball' in COCO
         self.out_dim = 5  # [x_norm, y_norm, dx, dy, confidence]
 
     def freeze(self) -> None:
-        """Imposta il modello in modalità eval."""
         self.eval()
         self.model.eval()
 
+    @staticmethod
     def flip_ball_tracking_coords(coords: torch.Tensor) -> torch.Tensor:
         """
         Flips tracking coordinates if the Video Flip augmentation has been applied.
@@ -389,29 +393,29 @@ class BallTrackerBackbone(nn.Module):
     @torch.no_grad()
     def _track_single_clip(self, clip_tensor: torch.Tensor) -> torch.Tensor:
         """
-        Processa una singola clip (C, T, H, W) con valori float in [0, 1].
+        Processes a single clip (C, T, H, W) with float values in [0, 1].
         """
         C, T, H, W = clip_tensor.shape
         
-        # Prepara il batch di frame direttamente come tensore PyTorch: (T, C, 640, 640)
-        # Permuta da (C, T, H, W) -> (T, C, H, W)
+        # Prepare the batch of frames directly as a PyTorch tensor: (T, C, 640, 640)
+        # Permute from (C, T, H, W) -> (T, C, H, W)
         batch_frames = clip_tensor.permute(1, 0, 2, 3).to(self.device)
 
-        # Rescale automatico a 640x640 per YOLO
+        # Automatic rescale to 640x640 for YOLO
         if H != 640 or W != 640:
             batch_frames = torch.nn.functional.interpolate(
                 batch_frames, size=(640, 640), mode="bilinear", align_corners=False
             )
 
-        # Passaggio forward diretto su AutoBackend (Niente Trainer, niente callback)
+        # Direct forward pass on AutoBackend
         preds = self.model(batch_frames)
         if isinstance(preds, (list, tuple)):
             preds = preds[0]
 
         coords = []
-        prev_x, prev_y = 0.5, 0.5  # Fallback al centro se non rilevata
+        prev_x, prev_y = 0.5, 0.5  # Fallback to center if not detected
 
-        # Processa le predizioni per ciascuno dei T frame
+        # Process predictions for each of the T frames
         for t in range(T):
             pred_frame = preds[t]  # (84, 8400)
             
@@ -428,7 +432,7 @@ class BallTrackerBackbone(nn.Module):
                 best_conf = float(valid_scores[best_idx].cpu().item())
                 best_box = valid_boxes[best_idx].cpu().numpy()
 
-                # Normalizzazione coordinate in [0, 1]
+                # Normalization of coordinates to [0, 1]
                 curr_x = float(best_box[0] / 640.0)
                 curr_y = float(best_box[1] / 640.0)
                 max_conf = best_conf
@@ -456,8 +460,8 @@ from typing import List
 
 class CompositeBackbone(nn.Module):
     """
-    Raccoglie una lista di istanze di backbone già create e
-    concatena le loro feature lungo l'ultimo asse (D).
+    Combines a list of already created backbone instances
+    and concatenates their features along the last axis (D).
     """
     def __init__(self, backbones: List[BaseBackbone]):
         super().__init__()
@@ -470,7 +474,7 @@ class CompositeBackbone(nn.Module):
         )
 
     def freeze(self) -> None:
-        """Mette tutte le backbone in eval mode e congela i parametri."""
+        """Put all backbones in eval mode and freeze their parameters."""
         for b in self.backbones:
             if hasattr(b, "freeze"):
                 b.freeze()
@@ -494,3 +498,323 @@ class CompositeBackbone(nn.Module):
                 features.append(b(x_norm))
         return torch.cat(features, dim=-1)
 
+
+class LSTAModule(nn.Module):
+    """
+    Long Short-Term Adaptive (LSTA) Module.
+    Applies adaptive temporal context to features extracted from the bottleneck.
+    """
+    def __init__(self, channels: int, kernel_size: int = 3, reduction: int = 4):
+        super().__init__()
+        self.channels = channels
+        self.kernel_size = kernel_size
+        
+        # 1. Gated Convolution Layer
+        self.gate_conv1 = nn.Conv1d(channels, channels, kernel_size=3, padding=1)
+        self.gate_conv2 = nn.Conv1d(channels, channels, kernel_size=1)
+        self.gate_conv3 = nn.Conv1d(channels, channels, kernel_size=3, padding=1)
+        
+        # 2. Short-Term Branch (Channel & Time)
+        red_dim = max(1, channels // reduction)
+        self.short_term = nn.Sequential(
+            nn.AdaptiveAvgPool1d(1),
+            nn.Conv1d(channels, red_dim, kernel_size=1),
+            nn.ReLU(inplace=True),
+            nn.Conv1d(red_dim, channels, kernel_size=1),
+            nn.Sigmoid()
+        )
+        
+        # 3. Long-Term Branch (Dynamic temporal kernels)
+        self.kernel_gen = nn.Sequential(
+            nn.AdaptiveAvgPool1d(1),
+            nn.Flatten(),
+            nn.Linear(channels, red_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(red_dim, channels * kernel_size)
+        )
+
+    def forward(self, x: torch.Tensor, B: int, T: int) -> torch.Tensor:
+        # x shape: (B*T, C, H, W)
+        _, C, H, W = x.shape
+        
+        # Global Spatial Average Pooling -> (B, C, T)
+        x_5d = x.view(B, T, C, H, W).permute(0, 2, 1, 3, 4)  # (B, C, T, H, W)
+        P = x_5d.mean(dim=(-2, -1))                          # (B, C, T)
+        
+        # Gated Convolution
+        gated = self.gate_conv3(self.gate_conv1(P) * self.gate_conv2(P))
+        G = P + gated
+        
+        # Short-Term Branch
+        V = self.short_term(G)  # (B, C, 1)
+        Z = G * V              # (B, C, T)
+        
+        # Long-Term Branch (Adaptive Temporal Depthwise Convolution)
+        kernels = self.kernel_gen(Z)                      # (B, C * K)
+        kernels = kernels.view(B, C, self.kernel_size)    # (B, C, K)
+        kernels = F.softmax(kernels, dim=-1)
+        
+        pad = self.kernel_size // 2
+        Z_padded = F.pad(Z, (pad, pad), mode="reflect")
+        Z_unfold = Z_padded.unfold(dimension=-1, size=self.kernel_size, step=1)  # (B, C, T, K)
+        Y_temp = (Z_unfold * kernels.unsqueeze(2)).sum(dim=-1)                   # (B, C, T)
+        
+        # Rescaling and spatial re-weighting
+        scale = Y_temp.unsqueeze(-1).unsqueeze(-1)  # (B, C, T, 1, 1)
+        out = x_5d * scale                          # (B, C, T, H, W)
+        return out.permute(0, 2, 1, 3, 4).reshape(B * T, C, H, W)
+
+
+class TSCIModule(nn.Module):
+    """
+    Triplet Spatial-Channel Interaction (TSCI) Module.
+    Models cross-dimensional Space-Channel interactions.
+    """
+    def __init__(self, channels: int, kernel_size: int = 7):
+        super().__init__()
+        padding = kernel_size // 2
+        self.conv_spatial = nn.Sequential(
+            nn.Conv2d(2, 1, kernel_size=kernel_size, padding=padding),
+            nn.BatchNorm2d(1),
+            nn.Sigmoid()
+        )
+        self.conv_channel = nn.Sequential(
+            nn.Conv1d(2, 1, kernel_size=kernel_size, padding=padding),
+            nn.BatchNorm1d(1),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x: torch.Tensor, B: int, T: int) -> torch.Tensor:
+        # x shape: (B*T, C, H, W)
+        BT, C, H, W = x.shape
+        
+        # 1. Spatial Attention
+        avg_s = x.mean(dim=1, keepdim=True)
+        max_s, _ = x.max(dim=1, keepdim=True)
+        s_pooled = torch.cat([avg_s, max_s], dim=1)  # (B*T, 2, H, W)
+        att_s = self.conv_spatial(s_pooled)          # (B*T, 1, H, W)
+        out_s = x * att_s
+        
+        # 2. Channel Attention
+        x_5d = x.view(B, T, C, H, W).permute(0, 2, 1, 3, 4)  # (B, C, T, H, W)
+        x_c_pool = x_5d.mean(dim=(-2, -1))                   # (B, C, T)
+        avg_c = x_c_pool.mean(dim=-1, keepdim=True)          # (B, C, 1)
+        max_c, _ = x_c_pool.max(dim=-1, keepdim=True)        # (B, C, 1)
+        c_pooled = torch.cat([avg_c, max_c], dim=2).transpose(1, 2)  # (B, 2, C)
+        att_c = self.conv_channel(c_pooled).transpose(1, 2).unsqueeze(-1).unsqueeze(-1)  # (B, C, 1, 1, 1)
+        out_c = (x_5d * att_c).permute(0, 2, 1, 3, 4).reshape(BT, C, H, W)
+        
+        return (out_s + out_c + x) / 3.0
+
+
+class ACABottleneck(nn.Module):
+    """
+    Wrapper of the ResNet Bottleneck with the injection of the ACA module (LSTA + TSCI).
+    """
+    def __init__(self, original_bottleneck: Bottleneck):
+        super().__init__()
+        self.conv1 = original_bottleneck.conv1
+        self.bn1 = original_bottleneck.bn1
+        self.relu = original_bottleneck.relu
+        
+        in_channels = original_bottleneck.conv1.out_channels
+        self.lsta = LSTAModule(channels=in_channels)
+        self.tsci = TSCIModule(channels=in_channels)
+        
+        self.conv2 = original_bottleneck.conv2
+        self.bn2 = original_bottleneck.bn2
+        self.conv3 = original_bottleneck.conv3
+        self.bn3 = original_bottleneck.bn3
+        self.downsample = original_bottleneck.downsample
+
+    def forward(self, x: torch.Tensor, B: int, T: int) -> torch.Tensor:
+        identity = x
+
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = self.relu(out)
+
+        # ACA-Module applied after the first 1x1 Conv
+        out = self.lsta(out, B, T)
+        out = self.tsci(out, B, T)
+
+        out = self.conv2(out)
+        out = self.bn2(out)
+        out = self.relu(out)
+
+        out = self.conv3(out)
+        out = self.bn3(out)
+
+        if self.downsample is not None:
+            identity = self.downsample(x)
+
+        out += identity
+        out = self.relu(out)
+        return out
+
+
+class ACANetBackbone(BaseBackbone):
+    """
+    ACA-Net Backbone for spatio-temporal feature extraction from video.
+    
+    Args:
+        out_dim (int): Output channel dimension (Default: 512).
+        pretrained (bool): Load ImageNet pre-trained weights for ResNet50.
+        freeze_resnet (bool): Freeze the trunk parameters if set to True.
+    """
+    NATIVE_OUT_DIM = 2048
+
+    def __init__(
+        self,
+        out_dim: int = 512,
+        pretrained: bool = True,
+        freeze_resnet: bool = False,
+    ):
+        super().__init__(out_dim=out_dim)
+        
+        weights = ResNet50_Weights.DEFAULT if pretrained else None
+        base_resnet = resnet50(weights=weights)
+        
+        # Initial Stem
+        self.stem = nn.Sequential(
+            base_resnet.conv1,
+            base_resnet.bn1,
+            base_resnet.relu,
+            base_resnet.maxpool
+        )
+        
+        # Bottleneck layers converted to ACA-Blocks
+        self.layer1 = self._wrap_layer(base_resnet.layer1)
+        self.layer2 = self._wrap_layer(base_resnet.layer2)
+        self.layer3 = self._wrap_layer(base_resnet.layer3)
+        self.layer4 = self._wrap_layer(base_resnet.layer4)
+        
+        self.avgpool = base_resnet.avgpool
+        
+        # Optional projection if out_dim != 2048
+        self.projection = (
+            nn.Identity()
+            if out_dim == self.NATIVE_OUT_DIM
+            else nn.Linear(self.NATIVE_OUT_DIM, out_dim)
+        )
+        
+        if freeze_resnet:
+            self.freeze()
+
+    def _wrap_layer(self, layer: nn.Sequential) -> nn.ModuleList:
+        wrapped_blocks = nn.ModuleList()
+        for block in layer:
+            wrapped_blocks.append(ACABottleneck(block))
+        return wrapped_blocks
+
+    def freeze(self) -> None:
+        
+        for param in self.parameters():
+            param.requires_grad = False
+        self.eval()
+
+    def unfreeze(self) -> None:
+        for param in self.parameters():
+            param.requires_grad = True
+        self.train()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.dim() != 5:
+            raise ValueError(
+                f"ACANetBackbone expects a 5D tensor (B, C, T, H, W), got {tuple(x.shape)}"
+            )
+        
+        B, C, T, H, W = x.shape
+        # Permutation for batch frame processing: (B*T, C, H, W)
+        x_2d = x.permute(0, 2, 1, 3, 4).reshape(B * T, C, H, W)
+        
+        feat = self.stem(x_2d)
+        
+        # Pass-through in the layers with temporal interaction between frames
+        for block in self.layer1: feat = block(feat, B, T)
+        for block in self.layer2: feat = block(feat, B, T)
+        for block in self.layer3: feat = block(feat, B, T)
+        for block in self.layer4: feat = block(feat, B, T)
+            
+        feat = self.avgpool(feat)           # (B*T, 2048, 1, 1)
+        feat = torch.flatten(feat, 1)       # (B*T, 2048)
+        feat = feat.view(B, T, 2048)        # (B, T, 2048)
+        
+        return self.projection(feat)        # (B, T, out_dim)
+
+
+class VideoSwinBackbone(BaseBackbone):
+    """
+    Video Swin Transformer backbone (Swin3D-Tiny).
+    Extracts spatio-temporal features based on 3D self-attention mechanisms (Shifted Windows).
+    
+    Plug-and-play implementation: 
+    Supports video input (B, C, T, H, W) and temporally realigns (via 1D interpolation) 
+    the output features to return the same length T as the input (B, T, out_dim).
+    """
+    NATIVE_OUT_DIM = 768  # Output channel dimension from swin3d_t feature block
+
+    def __init__(
+        self,
+        out_dim: int = 512,
+        pretrained: bool = True,
+        freeze_swin: bool = False,
+    ):
+        super().__init__(out_dim=out_dim)
+        
+        weights = Swin3D_T_Weights.DEFAULT if pretrained else None
+        model = swin3d_t(weights=weights)
+        
+        # Keep only the feature extractor and the normalization layer
+        self.features = model.features
+        self.norm = model.norm
+        
+        # Optional projection to align the requested out_dim (default 512)
+        self.projection = (
+            nn.Identity()
+            if out_dim == self.NATIVE_OUT_DIM
+            else nn.Linear(self.NATIVE_OUT_DIM, out_dim)
+        )
+        
+        if freeze_swin:
+            self.freeze()
+            
+    def freeze(self) -> None:
+        """Freezes the backbone parameters."""
+        for param in self.parameters():
+            param.requires_grad = False
+        self.eval()
+        
+    def unfreeze(self) -> None:
+        """Unfreezes the parameters for training."""
+        for param in self.parameters():
+            param.requires_grad = True
+        self.train()
+        
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.dim() != 5:
+            raise ValueError(
+                f"VideoSwinBackbone expects a 5D video tensor (B, C, T, H, W), got {tuple(x.shape)}."
+            )
+            
+        B, C, T_in, H, W = x.shape
+        
+        # Forward pass through the transformer: time might be compressed
+        # Output shape: (B, 768, T', H', W')
+        feat = self.features(x)  
+        feat = self.norm(feat)
+        
+        # Spatial Global Average Pooling
+        # Average only over H' and W' keeping T' (B, 768, T')
+        feat = feat.mean(dim=(-2, -1))
+        
+        # Video Swin usually downsamples the temporal axis (e.g. T/2).
+        # To maintain 1:1 compatibility with the Neck (B, T, out_dim), we interpolate the features
+        T_out = feat.shape[-1]
+        if T_out != T_in:
+            feat = F.interpolate(feat, size=T_in, mode="linear", align_corners=False)
+            
+        # Permute to (B, T, D) and final projection
+        feat = feat.transpose(1, 2).contiguous() # (B, T_in, 768)
+        
+        return self.projection(feat) # (B, T_in, out_dim)
