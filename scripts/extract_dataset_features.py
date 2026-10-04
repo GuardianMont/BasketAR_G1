@@ -8,11 +8,11 @@ import av
 import pandas as pd
 import torch
 import torch.nn as nn
-import torchvision.transforms.functional as F
 from torch.utils.data import DataLoader, Dataset
 
 from data import RandomTemporalShift, VideoHorizontalFlip
 from data.experiment_config import ExperimentConfig
+from data.spatial import preprocess_frame
 from data.utils import pad_and_collate_video_batch
 from data.temporal_sampling import (
     LegacyUniformSampler,
@@ -40,10 +40,6 @@ LABEL_TO_ID = {
     "idle": 7,
     "non-gioco": 8,
 }
-
-X3D_MEAN = (0.45, 0.45, 0.45)
-X3D_STD = (0.225, 0.225, 0.225)
-
 
 class ManifestVideoDataset(Dataset):
 
@@ -99,40 +95,12 @@ class ManifestVideoDataset(Dataset):
         return len(self.rows)
 
     def _preprocess_frame(self, frame):
-        array = frame.to_ndarray(format="rgb24")
-        x = (
-            torch.from_numpy(array)
-            .permute(2, 0, 1)
-            .contiguous()
-            .float()
-            / 255.0
+        return preprocess_frame(
+            frame,
+            spatial_mode=self.spatial_mode,
+            spatial_size=self.target_size,
+            color_mode=self.color_mode,
         )
-
-        _, h, w = x.shape
-        if self.spatial_mode == "stretch":
-            x_raw = F.resize(x, [self.target_size, self.target_size], antialias=True)
-        else:
-            if h > w:
-                new_h, new_w = self.target_size, int(w * (self.target_size / h))
-            else:
-                new_h, new_w = int(h * (self.target_size / w)), self.target_size
-
-            x = F.resize(x, [new_h, new_w], antialias=True)
-            pad_h = self.target_size - new_h
-            pad_w = self.target_size - new_w
-            padding = [
-                pad_w // 2,
-                pad_h // 2,
-                pad_w - pad_w // 2,
-                pad_h - pad_h // 2,
-            ]
-            x_raw = F.pad(x, padding, fill=0)
-
-        if self.color_mode == "grayscale":
-            x_raw = F.rgb_to_grayscale(x_raw, num_output_channels=3)
-
-        x_norm = F.normalize(x_raw, mean=X3D_MEAN, std=X3D_STD)
-        return x_norm, x_raw
 
     def _decode_clip(self, path):
         with av.open(str(path)) as container:

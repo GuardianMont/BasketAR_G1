@@ -1,5 +1,7 @@
 import argparse
+import json
 import os
+from inspect import Parameter, signature
 from pathlib import Path
 from typing import Dict, List, Tuple
 
@@ -7,12 +9,17 @@ import av
 import numpy as np
 import torch
 import torch.nn as nn
-import torchvision.transforms.functional as TF
 from sklearn.metrics import accuracy_score, classification_report, f1_score
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
 # Project imports
+from data.spatial import preprocess_frame
+from data.temporal_sampling import (
+    SAMPLER_REGISTRY,
+    TemporalSampler,
+    build_temporal_sampler,
+)
 from models import (
     ARPipeline,
     BallTrackerBackbone,
@@ -56,17 +63,22 @@ CLASS_NAMES_AGGREGATED = [
     "altro",
 ]
 
-X3D_MEAN = (0.45, 0.45, 0.45)
-X3D_STD = (0.225, 0.225, 0.225)
-
-
 class TestFolderDataset(Dataset):
     """Dataset per caricare i file video .mp4/.avi organizzati per sottocartelle."""
 
-    def __init__(self, test_root: str, num_frames: int = 16, crop_size: int = 312):
+    def __init__(
+        self,
+        test_root: str,
+        temporal_sampler: TemporalSampler,
+        spatial_mode: str = "letterbox",
+        spatial_size: int = 312,
+        color_mode: str = "rgb",
+    ):
         self.test_root = Path(test_root)
-        self.num_frames = num_frames
-        self.crop_size = crop_size
+        self.temporal_sampler = temporal_sampler
+        self.spatial_mode = spatial_mode
+        self.spatial_size = spatial_size
+        self.color_mode = color_mode
 
         self.samples = []
         for class_dir in sorted(self.test_root.iterdir()):
@@ -87,42 +99,25 @@ class TestFolderDataset(Dataset):
     def __len__(self):
         return len(self.samples)
 
-    def _uniform_indices(self, total_frames: int) -> List[int]:
-        if total_frames <= 0:
-            raise ValueError("Il video non contiene frame validi.")
-
-        if total_frames >= self.num_frames:
-            stride = total_frames / float(self.num_frames)
-            return [min(int(i * stride), total_frames - 1) for i in range(self.num_frames)]
-
-        indices = list(range(total_frames))
-        indices.extend([total_frames - 1] * (self.num_frames - total_frames))
-        return indices
-
     def _preprocess_frame(self, frame) -> Tuple[torch.Tensor, torch.Tensor]:
-        array = frame.to_ndarray(format="rgb24")
-        x_raw = torch.from_numpy(array).permute(2, 0, 1).contiguous().float() / 255.0
-
-        _, h, w = x_raw.shape
-        if h > w:
-            new_h, new_w = self.crop_size, int(w * (self.crop_size / h))
-        else:
-            new_h, new_w = int(h * (self.crop_size / w)), self.crop_size
-
-        x_raw = TF.resize(x_raw, [new_h, new_w], antialias=True)
-
-        pad_h, pad_w = self.crop_size - new_h, self.crop_size - new_w
-        padding = [pad_w // 2, pad_h // 2, pad_w - pad_w // 2, pad_h - pad_h // 2]
-        x_raw = TF.pad(x_raw, padding, fill=0)
-
-        x_norm = TF.normalize(x_raw, mean=X3D_MEAN, std=X3D_STD)
-        return x_norm, x_raw
+        return preprocess_frame(
+            frame,
+            spatial_mode=self.spatial_mode,
+            spatial_size=self.spatial_size,
+            color_mode=self.color_mode,
+        )
 
     def _decode_clip(self, path: Path) -> Tuple[torch.Tensor, torch.Tensor]:
         with av.open(str(path)) as container:
-            total_frames = sum(1 for _ in container.decode(video=0))
+            stream = container.streams.video[0]
+            total_frames = int(stream.frames or 0)
+            fps = float(stream.average_rate) if stream.average_rate else None
 
-        indices = self._uniform_indices(total_frames)
+        if total_frames <= 0:
+            with av.open(str(path)) as container:
+                total_frames = sum(1 for _ in container.decode(video=0))
+
+        indices = self.temporal_sampler.sample_indices(total_frames, fps=fps)
         wanted = set(indices)
         decoded_norm, decoded_raw = {}, {}
 
@@ -135,6 +130,10 @@ class TestFolderDataset(Dataset):
                 decoded_raw[frame_index] = raw_f
                 if len(decoded_norm) == len(wanted):
                     break
+
+        missing = sorted(wanted - set(decoded_norm))
+        if missing:
+            raise RuntimeError(f"Could not decode frames {missing} from {path}")
 
         frames_norm = [decoded_norm[i] for i in indices]
         frames_raw = [decoded_raw[i] for i in indices]
@@ -296,16 +295,120 @@ def collate_dual_clip_batch(batch: List[Dict]) -> Dict:
     }
 
 
+def resolve_evaluation_preprocessing(args):
+    """Resolve sampling and image preprocessing from a feature artifact or CLI."""
+    if args.feature_reference:
+        reference_path = Path(args.feature_reference)
+        if not reference_path.is_file():
+            raise FileNotFoundError(
+                f"File di riferimento delle feature non trovato: {reference_path}"
+            )
+        payload = torch.load(
+            reference_path,
+            map_location="cpu",
+            weights_only=False,
+        )
+        experiment_config = (
+            payload.get("metadata", {}).get("experiment_config")
+            if isinstance(payload, dict)
+            else None
+        )
+        if not isinstance(experiment_config, dict):
+            raise ValueError(
+                "Il file di riferimento non contiene "
+                "metadata['experiment_config']."
+            )
+        required_fields = {"sampler", "spatial_mode", "spatial_size", "color"}
+        missing_fields = sorted(required_fields - experiment_config.keys())
+        if missing_fields:
+            raise ValueError(
+                "Configurazione esperimento incompleta nel file di riferimento; "
+                f"mancano: {', '.join(missing_fields)}."
+            )
+        sampler_config = experiment_config["sampler"]
+        spatial_mode = experiment_config["spatial_mode"]
+        spatial_size = experiment_config["spatial_size"]
+        color_mode = experiment_config["color"]
+        config_source = str(reference_path)
+    else:
+        sampler_class = SAMPLER_REGISTRY.get(args.temporal_sampler)
+        if sampler_class is None:
+            available = ", ".join(sorted(SAMPLER_REGISTRY))
+            raise ValueError(
+                f"Unknown temporal sampler '{args.temporal_sampler}'. "
+                f"Available: {available}."
+            )
+        sampler_parameters = signature(sampler_class.__init__).parameters
+        sampler_config = {"name": args.temporal_sampler}
+        sampler_config.update(
+            {
+                name: getattr(args, name)
+                for name, parameter in sampler_parameters.items()
+                if name != "self"
+                and parameter.kind
+                not in (Parameter.VAR_POSITIONAL, Parameter.VAR_KEYWORD)
+                and hasattr(args, name)
+            }
+        )
+        spatial_mode = args.spatial_mode
+        spatial_size = args.spatial_size
+        color_mode = args.color
+        config_source = "argomenti CLI"
+
+    temporal_sampler = build_temporal_sampler(sampler_config)
+    if spatial_mode not in {"letterbox", "stretch"}:
+        raise ValueError(f"Unsupported spatial mode: {spatial_mode}")
+    if color_mode not in {"rgb", "grayscale"}:
+        raise ValueError(f"Unsupported color mode: {color_mode}")
+    if not isinstance(spatial_size, int) or spatial_size <= 0:
+        raise ValueError(f"spatial_size non valido: {spatial_size!r}")
+
+    resolved = {
+        "source": config_source,
+        "sampler": temporal_sampler.config(),
+        "spatial_mode": spatial_mode,
+        "spatial_size": spatial_size,
+        "color": color_mode,
+    }
+    return temporal_sampler, spatial_mode, spatial_size, color_mode, resolved
+
+
 def main():
     parser = argparse.ArgumentParser(description="Valutazione End-to-End della pipeline a cascata.")
     parser.add_argument("--test-dir", default="dataset/dataset_hd/test", help="Path directory del test set.")
     parser.add_argument("--output-dir", default="experiments/EVALUATION_CASCADE", help="Cartella dei risultati.")
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--workers", type=int, default=2)
+    parser.add_argument(
+        "--feature-reference",
+        default=None,
+        help="File .pt delle feature estratte: usa metadata['experiment_config'].",
+    )
+    parser.add_argument(
+        "--temporal-sampler",
+        choices=sorted(SAMPLER_REGISTRY),
+        default="legacy_uniform",
+    )
+    parser.add_argument("--num-frames", type=int, default=16)
+    parser.add_argument("--target-fps", type=float, default=15.0)
+    parser.add_argument("--frames-per-side", type=int, default=8)
+    parser.add_argument("--edge-strength", type=float, default=1.0)
+    parser.add_argument(
+        "--spatial-mode", choices=["letterbox", "stretch"], default="letterbox"
+    )
+    parser.add_argument("--spatial-size", type=int, default=312)
+    parser.add_argument("--color", choices=["rgb", "grayscale"], default="rgb")
 
     args = parser.parse_args()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[INFO] Device in uso: {device}")
+    temporal_sampler, spatial_mode, spatial_size, color_mode, preprocessing_config = (
+        resolve_evaluation_preprocessing(args)
+    )
+    print(
+        "[CONFIG] Preprocessing e campionamento: "
+        f"{json.dumps(preprocessing_config, ensure_ascii=False, sort_keys=True)}"
+    )
     os.makedirs(args.output_dir, exist_ok=True)
 
     # 1. Istanziazione Modelli con pesi hardcodati
@@ -320,7 +423,13 @@ def main():
     composite_backbone.freeze()
 
     # 3. Dataloader Test
-    test_dataset = TestFolderDataset(test_root=args.test_dir)
+    test_dataset = TestFolderDataset(
+        test_root=args.test_dir,
+        temporal_sampler=temporal_sampler,
+        spatial_mode=spatial_mode,
+        spatial_size=spatial_size,
+        color_mode=color_mode,
+    )
     test_loader = DataLoader(
         test_dataset,
         batch_size=args.batch_size,
