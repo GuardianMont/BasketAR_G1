@@ -12,12 +12,12 @@ sys.path.append(str(Path(__file__).resolve().parent.parent))
 
 from models.heads import AttentionClassifierHead, MeanPoolingClassifierHead
 from models.necks import BiGRUNeck, TCNNeck
+from utils.feature_loader import FeatureLoader
 from train_arch_ablation import (
     EXPERIMENTS,
     FIXED_DATA_CONFIG,
     build_dataloaders_for_phase,
     extract_best_configuration_per_phase,
-    load_preextracted_features,
     train_single_phase,
 )
 
@@ -134,11 +134,15 @@ def run_orchestrator(epochs=30, patience=5, num_runs=3):
 
     # Caricamento dataset
     logger.info("Caricamento delle feature fisse...")
-    raw_train_samples = load_preextracted_features(
-        FIXED_DATA_CONFIG["train_path"], FIXED_DATA_CONFIG["feature_dim"]
+    raw_train_samples = FeatureLoader.load(
+        FIXED_DATA_CONFIG["train_path"],
+        expected_dim=FIXED_DATA_CONFIG["feature_dim"],
+        expected_experiment_id=FIXED_DATA_CONFIG["experiment_id"],
     )
-    raw_val_samples = load_preextracted_features(
-        FIXED_DATA_CONFIG["val_path"], FIXED_DATA_CONFIG["feature_dim"]
+    raw_val_samples = FeatureLoader.load(
+        FIXED_DATA_CONFIG["val_path"],
+        expected_dim=FIXED_DATA_CONFIG["feature_dim"],
+        expected_experiment_id=FIXED_DATA_CONFIG["experiment_id"],
     )
 
     best_params_per_phase = {}

@@ -104,37 +104,6 @@ EXPERIMENTS = {
 }
 
 
-def load_preextracted_features(pt_file_path: str, expected_dim: int):
-    """Load and validate a real feature payload."""
-    if not os.path.exists(pt_file_path):
-        raise FileNotFoundError(
-            f"Feature file '{pt_file_path}' not found. Extract features before training."
-        )
-
-    payload = torch.load(pt_file_path, map_location="cpu", weights_only=False)
-    if not isinstance(payload, dict):
-        raise ValueError(f"Invalid feature payload in '{pt_file_path}': expected a dictionary.")
-    if payload.get("feature_dim") != expected_dim:
-        raise ValueError(
-            f"Expected feature dimension {expected_dim}, got "
-            f"{payload.get('feature_dim')} in '{pt_file_path}'."
-        )
-    print(
-        f"[INFO] Loaded {payload['num_samples']} samples (Dimension"
-        f" D={payload['feature_dim']}) from '{pt_file_path}' "
-        f"(metadata={payload.get('metadata', {})})"
-    )
-
-    samples = payload.get("samples")
-    if not isinstance(samples, list) or not samples:
-        raise ValueError(f"Invalid or empty feature payload: '{pt_file_path}'")
-    for index, sample in enumerate(samples):
-        data = sample.get("data")
-        if not torch.is_tensor(data) or data.ndim != 2 or data.shape[1] != expected_dim:
-            raise ValueError(f"Invalid feature tensor in sample {index} of '{pt_file_path}'.")
-    return samples
-
-
 def build_dataloaders_for_phase(train_samples, val_samples, phase: str):
     """Filters dataset samples by phase constraints and creates DataLoaders."""
     p_cfg = PHASE_CONFIGS[phase]
