@@ -41,6 +41,21 @@ LABEL_TO_ID = {
     "non-gioco": 8,
 }
 
+
+def validate_tracker_preprocessing(
+    spatial_mode: str, color: str, feature_stream: str
+) -> None:
+    """Tracker preprocessing is supported only on RGB letterboxed frames."""
+    if (
+        feature_stream in {"3d_tracker", "all"}
+        and (spatial_mode != "letterbox" or color != "rgb")
+    ):
+        raise ValueError(
+            "Il tracker richiede preprocessing letterbox e RGB; per i confronti "
+            "su spatial_mode/colore usa --feature-stream 3d."
+        )
+
+
 class ManifestVideoDataset(Dataset):
 
     def __init__(
@@ -217,6 +232,9 @@ def build_backbone_and_filename(
 
 
 def extract_all_configurations(args):
+    validate_tracker_preprocessing(
+        args.spatial_mode, args.color, args.feature_stream
+    )
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 

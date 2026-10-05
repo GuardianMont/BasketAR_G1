@@ -15,8 +15,12 @@ class VideoRandomHorizontalFlip:
         return clip
 
 
-# Backward-compatible public name used by the feature extraction script.
-VideoHorizontalFlip = VideoRandomHorizontalFlip
+# Deterministic flip used by the feature extraction script.
+class VideoHorizontalFlip:
+    """Deterministically flip every frame horizontally."""
+
+    def __call__(self, clip: torch.Tensor) -> torch.Tensor:
+        return torch.flip(clip, dims=[-1])
 
 
 class VideoColorJitter:

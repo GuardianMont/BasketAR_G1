@@ -21,6 +21,7 @@ from data.utils import compute_class_weights, pad_and_collate_video_batch
 from models.heads import AttentionClassifierHead, MeanPoolingClassifierHead
 from models.necks import BiGRUNeck, TCNNeck
 from models.pipeline import ARPipeline
+from utils.feature_loader import load_experiment_feature_pair
 
 
 PHASES = {
@@ -43,26 +44,6 @@ def baseline_config():
         extra={"transform": "none"},
     )
 
-
-def load_features(path: str, expected_id: str):
-    payload = torch.load(path, map_location="cpu", weights_only=False)
-    if not isinstance(payload, dict):
-        raise ValueError(f"Invalid feature file (expected dictionary): {path}")
-    metadata = payload.get("metadata", {})
-    if metadata.get("experiment_id") != expected_id:
-        raise ValueError(
-            f"Feature config mismatch in {path}: expected {expected_id!r}, "
-            f"got {metadata.get('experiment_id')!r}."
-        )
-    samples = payload.get("samples")
-    feature_dim = payload.get("feature_dim")
-    if not isinstance(samples, list) or not samples or not isinstance(feature_dim, int):
-        raise ValueError(f"Invalid or empty feature payload: {path}")
-    for i, sample in enumerate(samples):
-        data = sample.get("data")
-        if not torch.is_tensor(data) or data.ndim != 2 or data.shape[1] != feature_dim:
-            raise ValueError(f"Bad feature tensor at sample {i} in {path}")
-    return samples, feature_dim
 
 
 def make_model(architecture: str, feature_dim: int, num_classes: int):
@@ -131,6 +112,7 @@ def run_one(
     patience: int,
     class_weights: torch.Tensor,
     output_dir: str,
+    experiment_id: str,
 ):
     seed_everything(seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -176,7 +158,10 @@ def run_one(
     model_key = f"{architecture}__{phase}__lr{learning_rate:g}__seed{seed}"
     os.makedirs(output_dir, exist_ok=True)
     checkpoint_path = os.path.join(output_dir, f"{model_key}.pt")
-    torch.save(best_state, checkpoint_path)
+    torch.save(
+        {"model_state_dict": best_state, "experiment_id": experiment_id},
+        checkpoint_path,
+    )
     cm = confusion_matrix(
         best_truth,
         best_predictions,
@@ -199,6 +184,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--train-features", default=None)
     parser.add_argument("--val-features", default=None)
+    parser.add_argument("--expected-experiment-id", default=None)
     parser.add_argument("--output-dir", default=None)
     parser.add_argument("--architectures", nargs="+", choices=ARCHITECTURES, default=list(ARCHITECTURES))
     parser.add_argument("--phases", nargs="+", choices=tuple(PHASES), default=list(PHASES))
@@ -213,17 +199,37 @@ def main():
     config = baseline_config()
     train_path = args.train_features or f"features/{config.feature_filename('train')}"
     val_path = args.val_features or f"features/{config.feature_filename('val')}"
-    output_dir = args.output_dir or os.path.join(
-        "experiments", f"PHASE1_BASELINE_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    default_experiment_id = (
+        config.feature_id()
+        if not args.train_features and not args.val_features and not args.expected_experiment_id
+        else None
     )
+    train_payload, val_payload, experiment_id, experiment_config = load_experiment_feature_pair(
+        train_path,
+        val_path,
+        default_experiment_id=default_experiment_id,
+        expected_experiment_id=args.expected_experiment_id,
+    )
+    feature_dim = int(train_payload["feature_dim"])
+    train_samples = train_payload["samples"]
+    val_samples = val_payload["samples"]
+    if experiment_config is None and experiment_id == config.feature_id():
+        experiment_config = config.to_dict()
+
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    output_parent = args.output_dir or "experiments"
+    output_dir = os.path.join(output_parent, f"PHASE1_{experiment_id}_{timestamp}")
     if args.num_runs < 1 or args.epochs < 1 or args.patience < 1:
         raise ValueError("num-runs, epochs, and patience must all be positive.")
     if any(lr <= 0 for lr in args.learning_rates):
         raise ValueError("All learning rates must be positive.")
     os.makedirs(output_dir, exist_ok=True)
     run_config = {
-        "feature_config": config.to_dict(),
-        "feature_experiment_id": config.feature_id(),
+        "feature_config": experiment_config,
+        "experiment_config": experiment_config,
+        "experiment_id": experiment_id,
+        "feature_experiment_id": experiment_id,
+        "feature_dim": feature_dim,
         "train_features": train_path,
         "validation_features": val_path,
         "architectures": {
@@ -242,11 +248,6 @@ def main():
     }
     with open(os.path.join(output_dir, "run_config.json"), "w", encoding="utf-8") as f:
         json.dump(run_config, f, indent=2, ensure_ascii=False)
-    train_samples, feature_dim = load_features(train_path, config.feature_id())
-    val_samples, val_dim = load_features(val_path, config.feature_id())
-    if feature_dim != val_dim:
-        raise ValueError(f"Train/val feature dimensions differ: {feature_dim} vs {val_dim}")
-
     results = []
     for architecture in args.architectures:
         for phase in args.phases:
@@ -273,8 +274,9 @@ def main():
                         args.patience,
                         weights,
                         output_dir,
+                        experiment_id,
                     )
-                    result["feature_experiment_id"] = config.feature_id()
+                    result["feature_experiment_id"] = experiment_id
                     results.append(result)
 
     os.makedirs(output_dir, exist_ok=True)

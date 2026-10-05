@@ -35,6 +35,7 @@ __all__ = [
     "SAMPLER_REGISTRY",
     "register_sampler",
     "build_temporal_sampler",
+    "VideoHorizontalFlip",
     "VideoRandomHorizontalFlip",
     "VideoColorJitter",
     "RandomTemporalShift",

@@ -8,11 +8,11 @@ class FeatureLoader:
     """Load and validate pre-extracted feature payloads."""
 
     @staticmethod
-    def load(
+    def load_payload(
         pt_file_path: str,
         expected_dim: int | None = None,
         expected_experiment_id: str | None = None,
-    ) -> list[dict[str, Any]]:
+    ) -> dict[str, Any]:
         if not os.path.isfile(pt_file_path):
             raise FileNotFoundError(
                 f"Feature file not found: '{pt_file_path}'. "
@@ -80,4 +80,60 @@ class FeatureLoader:
             f"sampler={sampling}, spatial_mode={spatial_mode}, spatial_size={spatial_size}, color={color}, "
             f"experiment_id={experiment_id or 'unavailable'}"
         )
-        return list(samples)
+        return payload
+
+    @staticmethod
+    def load(
+        pt_file_path: str,
+        expected_dim: int | None = None,
+        expected_experiment_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        payload = FeatureLoader.load_payload(
+            pt_file_path,
+            expected_dim=expected_dim,
+            expected_experiment_id=expected_experiment_id,
+        )
+        return list(payload["samples"])
+
+
+def load_experiment_feature_pair(
+    train_path: str,
+    val_path: str | None = None,
+    default_experiment_id: str | None = None,
+    expected_experiment_id: str | None = None,
+) -> tuple[dict[str, Any], dict[str, Any] | None, str, dict[str, Any] | None]:
+    """Load a train/validation pair and resolve its experiment from train metadata."""
+    train_payload = FeatureLoader.load_payload(train_path)
+    train_metadata = train_payload.get("metadata")
+    train_metadata = train_metadata if isinstance(train_metadata, dict) else {}
+    train_experiment_id = train_metadata.get("experiment_id")
+
+    resolved_id = expected_experiment_id or train_experiment_id or default_experiment_id
+    if resolved_id is None:
+        raise ValueError(
+            f"Feature file '{train_path}' has no metadata['experiment_id']; "
+            "pass --expected-experiment-id only when the intended ID is known."
+        )
+    if train_experiment_id is None:
+        raise ValueError(
+            f"Feature file '{train_path}' has no metadata['experiment_id']; "
+            "cannot verify the selected experiment."
+        )
+    if train_experiment_id != resolved_id:
+        raise ValueError(
+            f"Experiment mismatch in '{train_path}': metadata experiment_id is "
+            f"{train_experiment_id!r}, expected {resolved_id!r}."
+        )
+
+    val_payload = None
+    if val_path is not None:
+        val_payload = FeatureLoader.load_payload(
+            val_path,
+            expected_dim=train_payload["feature_dim"],
+            expected_experiment_id=resolved_id,
+        )
+
+    experiment_config = train_metadata.get("experiment_config")
+    if not isinstance(experiment_config, dict):
+        experiment_config = None
+    return train_payload, val_payload, resolved_id, experiment_config

@@ -14,6 +14,7 @@ from data.utils import pad_and_collate_video_batch
 from models.heads import MeanPoolingClassifierHead
 from models.necks import BiGRUNeck
 from models.pipeline import ARPipeline
+from utils.feature_loader import load_experiment_feature_pair
 
 
 def stratified_subset(samples, target_size: int, seed: int):
@@ -45,6 +46,7 @@ def stratified_subset(samples, target_size: int, seed: int):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--features", default=None)
+    parser.add_argument("--expected-experiment-id", default=None)
     parser.add_argument("--num-clips", type=int, default=40, choices=range(30, 51))
     parser.add_argument("--epochs", type=int, default=200)
     parser.add_argument("--learning-rate", type=float, default=0.005)
@@ -62,15 +64,18 @@ def main():
         extra={"transform": "none"},
     )
     feature_path = args.features or f"features/{config.feature_filename('train')}"
-    payload = torch.load(feature_path, map_location="cpu", weights_only=False)
-    if not isinstance(payload, dict) or payload.get("metadata", {}).get("experiment_id") != config.feature_id():
-        raise ValueError(
-            "The feature file does not identify the expected Phase 1 baseline config. "
-            f"Expected experiment_id={config.feature_id()!r}."
-        )
-    samples = payload.get("samples")
-    if not isinstance(samples, list) or not samples:
-        raise ValueError(f"Invalid or empty feature file: {feature_path}")
+    default_experiment_id = (
+        config.feature_id()
+        if not args.features and not args.expected_experiment_id
+        else None
+    )
+    payload, _, experiment_id, _ = load_experiment_feature_pair(
+        feature_path,
+        default_experiment_id=default_experiment_id,
+        expected_experiment_id=args.expected_experiment_id,
+    )
+    samples = payload["samples"]
+    print(f"[INFO] Sanity experiment_id={experiment_id}")
 
     subset = stratified_subset(samples, args.num_clips, args.seed)
     dataset = ActionRecognitionDataset(subset, is_feature_dataset=True)
@@ -78,7 +83,9 @@ def main():
     features = batch["x"]
     lengths = batch["lengths"]
     labels = batch["label_orig"]
-    feature_dim = int(features.shape[-1])
+    feature_dim = int(payload["feature_dim"])
+    if int(features.shape[-1]) != feature_dim:
+        raise ValueError("Collated feature dimension differs from payload feature_dim.")
     num_classes = int(max(int(sample["label"]) for sample in subset) + 1)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
