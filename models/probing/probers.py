@@ -123,19 +123,17 @@ class KNNProber(BaseProber):
 # Note: this strategy doesn't allow batching.
 # As long as k-NN or clustering will be used as prober it won't be possible
 class ProbingEvaluator:
-    """Evaluates a list of probers on the same dataset.
+    """Evaluates a list of probers on the same dataset across multiple runs.
+    
     Attributes:
         probers (List[BaseProber]): List of probers to evaluate.
-    Returns:
-        Dict[str, Tuple[np.ndarray, np.ndarray]]: A dictionary where keys are \
-            prober names and values are tuples of (true_labels, predicted_labels).    
     """
     def __init__(self, probers: List[BaseProber]):
         self.probers = probers
 
     def _run_prober(
         self, prober: BaseProber, X_tr: np.ndarray, y_tr: np.ndarray, X_te: np.ndarray, y_te: np.ndarray
-    ) -> Tuple[str, Dict[str, Any]]:
+    ) -> Tuple[str, np.ndarray, np.ndarray]:
         scaler = StandardScaler()
         X_tr_scaled = scaler.fit_transform(X_tr)
         X_te_scaled = scaler.transform(X_te)
@@ -146,15 +144,29 @@ class ProbingEvaluator:
         return prober.name, y_te, preds
 
     def evaluate(
-        self, X_train: np.ndarray, y_train: np.ndarray, X_test: np.ndarray, y_test: np.ndarray    
-    ) -> Dict[str, Tuple[np.ndarray, np.ndarray]]:
-        results = {}
+        self, 
+        X_train: np.ndarray, 
+        y_train: np.ndarray, 
+        X_test: np.ndarray, 
+        y_test: np.ndarray,
+        times: int = 1
+    ) -> Dict[str, List[Tuple[np.ndarray, np.ndarray]]]:
+        """
+        Executes 'times' evaluation runs for each prober and returns a dictionary 
+        mapping each prober name to a list of (y_true, y_pred) tuples.
+        """
+        results: Dict[str, List[Tuple[np.ndarray, np.ndarray]]] = {
+            prober.name: [] for prober in self.probers
+        }
+
         with ThreadPoolExecutor() as executor:
-            futures = [
-                executor.submit(self._run_prober, prober, X_train, y_train, X_test, y_test)
-                for prober in self.probers
-            ]
-            for future in futures:
-                name, y_te, preds = future.result()
-                results[name] = (y_te, preds)
+            for _ in range(times):
+                futures = [
+                    executor.submit(self._run_prober, prober, X_train, y_train, X_test, y_test)
+                    for prober in self.probers
+                ]
+                for future in futures:
+                    name, y_te, preds = future.result()
+                    results[name].append((y_te, preds))
+
         return results
