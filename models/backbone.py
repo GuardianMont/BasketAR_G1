@@ -1,6 +1,7 @@
 """
 Implementations of spatial and spatio-temporal backbone modules.
 """
+import os
 from typing import Optional, Dict, Type, List, Any
 from enum import Enum
 
@@ -670,8 +671,7 @@ class VideoSwinBackbone(BaseBackbone):
     Extracts spatio-temporal features based on 3D self-attention mechanisms (Shifted Windows).
     
     Plug-and-play implementation: 
-    Supports video input (B, C, T, H, W) and temporally realigns (via 1D interpolation) 
-    the output features to return the same length T as the input (B, T, out_dim).
+    Supports video input (B, C, T, H, W) but halves the temporal resolution (T/2).
     """
 
     def __init__(
@@ -681,12 +681,8 @@ class VideoSwinBackbone(BaseBackbone):
     ):
         super().__init__(out_dim=768, pretrained=pretrained, freeze_net=freeze_net)
         
-        weights = Swin3D_T_Weights.DEFAULT if pretrained else None
-        model = swin3d_t(weights=weights)
-        
-        # Keep only the feature extractor and the normalization layer
-        self.features = model.features
-        self.norm = model.norm
+        weights = Swin3D_T_Weights.KINETICS400_V1 if pretrained else None
+        self.swin = swin3d_t(weights=weights)
         
         if freeze_net:
             self.freeze()
@@ -699,28 +695,26 @@ class VideoSwinBackbone(BaseBackbone):
             
         B, C, T_in, H, W = x.shape
         
-        # Forward pass through the transformer: time might be compressed
-        # Output shape: (B, 768, T', H', W')
-        feat = self.features(x)  
-        feat = self.norm(feat)
+        # (B, 3, T, H, W) -> (B, T_pad, H_pad, W_pad, 96)
+        x = self.swin.patch_embed(x)
+        x = self.swin.pos_drop(x)
+
+        # (B, T_pad, H_pad, W_pad, 96) -> (B, T', H', W', 768)
+        x = self.swin.features(x)
+
+        x = self.swin.norm(x)
+
+        # Average only over H' and W' keeping T' (B, T', 768)
+        feat = x.mean(dim=(2, 3))
+                    
+        feat = feat.contiguous() # (B, T', 768)
         
-        # Spatial Global Average Pooling
-        # Average only over H' and W' keeping T' (B, 768, T')
-        feat = feat.mean(dim=(-2, -1))
-        
-        # Video Swin usually downsamples the temporal axis (e.g. T/2).
-        # To maintain 1:1 compatibility with the Neck (B, T, out_dim), we interpolate the features
-        T_out = feat.shape[-1]
-        if T_out != T_in:
-            feat = F.interpolate(feat, size=T_in, mode="linear", align_corners=False)
-            
-        # Permute to (B, T, D)
-        feat = feat.transpose(1, 2).contiguous() # (B, T_in, 768)
-        
-        return feat # (B, T_in, out_dim)
+        return feat # (B, T', out_dim)
 
 #Checkpoint UniFormer-XXS addestrato su Kinetics-400 (16 frame)
 UNIFORMER_XXS_K400_URL = "https://github.com/SenseTime-Research/UniFormer/releases/download/v1.0/uniformer_xxs_k400_16x4.pth"
+UNIFORMER_XXS_224 = "weights/uniformer_xxs_224_in1k.pth"
+UNIFORMER_XXS_128 = "weights/uniformer_xxs_128_in1k.pth"
 
 class DynamicPositionEmbedding(nn.Module):
     """Dynamic Position Embedding (DPE) with 3D Depthwise Convolution."""
@@ -882,15 +876,25 @@ class UniFormerXXSBackbone(BaseBackbone):
 
         # Loading pre-trained weights
         if pretrained:
-            self._load_pretrained_weights(UNIFORMER_XXS_K400_URL)
+            self._load_pretrained_weights(UNIFORMER_XXS_128)
 
-    def _load_pretrained_weights(self, url: str):
-        print(f"Downloading/Loading pre-trained weights from {url}...")
-        checkpoint = torch.hub.load_state_dict_from_url(
-            url, progress=True, map_location='cpu'
-        )
+    def _load_pretrained_weights(self, weights_path_or_url: str):
+        """Carica i pesi da un file locale .pth/.pt o da URL se valido."""
+        if os.path.exists(weights_path_or_url):
+            print(f"Loading pre-trained weights from local file: {weights_path_or_url}")
+            checkpoint = torch.load(weights_path_or_url, map_location="cpu", weights_only=False)
+        elif weights_path_or_url.startswith("http://") or weights_path_or_url.startswith("https://"):
+            print(f"Downloading/Loading pre-trained weights from {weights_path_or_url}...")
+            checkpoint = torch.hub.load_state_dict_from_url(
+                weights_path_or_url, progress=True, map_location="cpu"
+            )
+        else:
+            raise FileNotFoundError(
+                f"Pretrained weights file not found at '{weights_path_or_url}' and it is not a valid URL."
+            )
 
-        state_dict = checkpoint.get('model', checkpoint.get('state_dict', checkpoint))
+        # Estrazione del dictionary di pesi gestendo eventuali wrapper (es. 'model', 'state_dict', ecc.)
+        state_dict = checkpoint.get("model", checkpoint.get("state_dict", checkpoint))
         
         cleaned_state_dict = {}
         for key, value in state_dict.items():
