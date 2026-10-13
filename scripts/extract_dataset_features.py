@@ -27,6 +27,7 @@ from models import (
     X3DLBackbone,
     X3DSBackbone,
 )
+from models.backbone import BackboneType, BackboneFactory
 from scripts.extract_features import extract_features_offline
 
 LABEL_TO_ID = {
@@ -186,7 +187,7 @@ class ManifestVideoDataset(Dataset):
 
 def build_backbone_and_filename(
     config_type: str,
-    backbone_type: str = "X3D-L",
+    backbone_type: str = BackboneType.X3D_L.value,
     tracker_model_path: str = "yolov8n.pt",
 ) -> tuple[nn.Module, str]:
     """Costruisce la CompositeBackbone dagli import ufficiali di models e
@@ -196,23 +197,10 @@ def build_backbone_and_filename(
     backbone_list = []
     filename_parts = ["3d"]
 
-    is_large = backbone_type.upper() == "X3D-L"
-    if is_large:
-        # X3D-L nativa estrae D=432
-        backbone_list.append(
-            X3DLBackbone(out_dim=432, pretrained=True, freeze_x3d=True)
-        )
-        print(f"[DEBUG DIRECT] Created X3DLBackbone with out_dim={backbone_list[-1].out_dim}")
-    else:
-        # X3D-S nativa estrae D=192
-        backbone_list.append(
-            X3DSBackbone(out_dim=192, pretrained=True, freeze_x3d=True)
-        )
-        print(f"[DEBUG DIRECT] Created X3DSBackbone with out_dim={backbone_list[-1].out_dim}")
-
-    if "2d" in config_type:
-        backbone_list.append(ConvNeXt2DBackbone(pretrained=True))
-        filename_parts.append("2d")
+    factory = BackboneFactory()
+    backbone = factory.create(backbone_type, pretrained=True, freeze_net=True)
+    backbone_list.append(backbone)
+    print(f"[DEBUG DIRECT] Created {backbone_type} with out_dim={backbone_list[-1].out_dim}")
 
     if "tracker" in config_type:
         backbone_list.append(
@@ -220,7 +208,7 @@ def build_backbone_and_filename(
         )
         filename_parts.append("tracker")
 
-    if is_large:
+    if isinstance(backbone, X3DLBackbone):
         filename_parts.append("L")
 
     output_filename = f"{'_'.join(filename_parts)}.pt"
@@ -238,7 +226,7 @@ def extract_all_configurations(args):
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    target_size = 312 if args.backbone_type.upper() == "X3D-L" else 192
+    target_size = BackboneFactory().create(args.backbone_type).out_dim
 
     print(
         f"\n{'='*70}\n[RUNNER] Inizio estrazione per SPLIT:"
@@ -362,8 +350,8 @@ def main():
     )
     parser.add_argument(
         "--backbone-type",
-        choices=["X3D-S", "X3D-L"],
-        default="X3D-L",
+        choices=BackboneType.list_names(),
+        default=BackboneType.X3D_L.value,
     )
     parser.add_argument(
         "--tracker-model-path",
