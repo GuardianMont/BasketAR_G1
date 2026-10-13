@@ -9,9 +9,11 @@ import torch.nn as nn
 
 class BaseBackbone(nn.Module, ABC):
     """Abstract Base Class for spatial or spatio-temporal feature extractors."""
-    def __init__(self, out_dim: int):
+    def __init__(self, out_dim: int, pretrained: bool = True, freeze_net: bool = True):
         super().__init__()
         self.out_dim = out_dim
+        self.pretrained = pretrained
+        self.freeze_net = freeze_net
 
     @abstractmethod
     def forward(
@@ -20,6 +22,18 @@ class BaseBackbone(nn.Module, ABC):
         lengths: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         pass
+
+    def freeze(self) -> None:
+        """Freezes the backbone parameters to prevent gradient updates."""
+        for param in self.parameters():
+            param.requires_grad = False
+        self.eval()
+
+    def unfreeze(self) -> None:
+        """Unfreezes the backbone parameters to allow gradient updates."""
+        for param in self.parameters():
+            param.requires_grad = True
+        self.train()
 
 
 class BaseTemporalNeck(nn.Module, ABC):

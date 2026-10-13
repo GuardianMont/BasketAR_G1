@@ -1,7 +1,8 @@
 """
 Implementations of spatial and spatio-temporal backbone modules.
 """
-from typing import Optional
+from typing import Optional, Dict, Type, List, Any
+from enum import Enum
 
 import torch
 import torch.nn as nn
@@ -13,6 +14,60 @@ from torchvision.models.video import swin3d_t, Swin3D_T_Weights
 from .base import BaseBackbone
 
 
+class BackboneType(str, Enum):
+    X3D_S = "X3D-S"
+    X3D_L = "X3D-L"
+    CONVNEXT_2D = "CONVNEXT-2D"
+    ACA_NET = "ACA-NET"
+    VIDEO_SWIN = "VIDEO-SWIN"
+    UNIFORMER_XXS = "UNIFORMER-XXS"
+
+    @classmethod
+    def list_names(cls) -> List[str]:
+        return [b.value for b in cls]
+
+
+class BackboneFactory:
+    _registry: Dict[str, Type[BaseBackbone]] = {}
+
+    @classmethod
+    def register(cls, name: str):
+        def decorator(subclass: Type[BaseBackbone]):
+            cls._registry[name.upper()] = subclass
+            return subclass
+        return decorator
+
+    @classmethod
+    def create(
+        cls, 
+        backbone_type: str | BackboneType, 
+        pretrained: bool = True, 
+        freeze_net: bool = True,
+        **kwargs: Any
+    ) -> BaseBackbone:
+        """Instantiates and returns the requested backbone.
+        Args:
+            backbone_type: String or Enum of the backbone name.
+            pretrained: Whether to load pretrained weights.
+            freeze_net: Whether to freeze the network parameters.
+            **kwargs: Additional arguments for advanced backbone configurations.
+        """
+        key = (backbone_type.value if isinstance(backbone_type, BackboneType) else str(backbone_type)).upper()
+
+        if key not in cls._registry:
+            valid_names = ", ".join(cls._registry.keys())
+            raise ValueError(f"Backbone '{key}' in registry. Valid names: [{valid_names}]")
+
+        backbone_cls = cls._registry[key]
+        
+        return backbone_cls(pretrained=pretrained, freeze_net=freeze_net, **kwargs)
+
+    @classmethod
+    def list_available(cls) -> List[str]:
+        return sorted(list(cls._registry.keys()))
+
+
+@BackboneFactory.register(BackboneType.X3D_S)
 class X3DSBackbone(BaseBackbone):
     """
     X3D-S spatio-temporal feature extractor.
@@ -27,44 +82,30 @@ class X3DSBackbone(BaseBackbone):
 
     Notes:
         - PyTorchVideo X3D-S has a native final trunk width of 192 channels.
-        - The project proposal uses D=512 for X3D-S features, therefore a small
-          linear projection is used by default to map 192 -> 512.
         - X3D-S does not downsample the temporal axis in its stem/residual stages,
           so the output temporal length is preserved (T_out = T_in).
-        - `freeze_x3d=True` freezes only the pretrained X3D trunk. The optional
-          output projection remains trainable, which allows adapting the native
-          X3D feature width to the project feature dimension.
 
     Args:
-        out_dim (int, optional): Output feature dimension. Default: 512.
+        out_dim (int, optional): Output feature dimension. Default: 192.
         pretrained (bool, optional): Load Kinetics-pretrained X3D-S weights.
             Default: True.
-        freeze_x3d (bool, optional): Freeze the X3D trunk parameters and keep its
+        freeze_net (bool, optional): Freeze the X3D trunk parameters and keep its
             BatchNorm layers in evaluation mode. Default: True.
         progress (bool, optional): Show the checkpoint download progress bar when
             pretrained weights are requested. Default: True.
-        x3d_model (nn.Module, optional): Pre-built X3D-compatible model. Intended
-            for dependency injection in tests or custom checkpoint loading. The
-            module must expose a `blocks` attribute whose final block is the
-            original classification head.
     """
 
-    NATIVE_OUT_DIM = 192
 
     def __init__(
         self,
-        out_dim: int = 512,
         pretrained: bool = True,
-        freeze_x3d: bool = True,
+        freeze_net: bool = True,
         progress: bool = True,
-        x3d_model: Optional[nn.Module] = None,
     ):
-        if out_dim <= 0:
-            raise ValueError(f"out_dim must be > 0, got {out_dim}.")
 
-        super().__init__(out_dim=out_dim)
+        super().__init__(out_dim=192, pretrained=pretrained, freeze_net=freeze_net)
 
-        model = x3d_model or self._load_x3d_s(pretrained=pretrained, progress=progress)
+        model = self._load_x3d_s(pretrained=pretrained, progress=progress)
         self._validate_x3d_model(model)
 
         # PyTorchVideo X3D is structured as:
@@ -73,15 +114,8 @@ class X3DSBackbone(BaseBackbone):
         # it must be removed to preserve the temporal feature sequence.
         self.trunk = nn.Sequential(*list(model.blocks[:-1]))
 
-        self.projection = (
-            nn.Identity()
-            if out_dim == self.NATIVE_OUT_DIM
-            else nn.Linear(self.NATIVE_OUT_DIM, out_dim)
-        )
-
-        self._x3d_frozen = False
-        if freeze_x3d:
-            self.freeze_x3d()
+        if freeze_net:
+            self.freeze()
 
     @staticmethod
     def _load_x3d_s(pretrained: bool, progress: bool) -> nn.Module:
@@ -105,47 +139,6 @@ class X3DSBackbone(BaseBackbone):
                 "and one classification head."
             )
 
-    def freeze_x3d(self) -> None:
-        """Freeze the pretrained X3D trunk while leaving the projection trainable."""
-        for parameter in self.trunk.parameters():
-            parameter.requires_grad = False
-        self.trunk.eval()
-        self._x3d_frozen = True
-
-    def unfreeze_x3d(self) -> None:
-        """Unfreeze the X3D trunk for optional end-to-end fine-tuning."""
-        for parameter in self.trunk.parameters():
-            parameter.requires_grad = True
-        self._x3d_frozen = False
-        self.trunk.train(self.training)
-
-    def freeze(self) -> None:
-        """Freeze the entire backbone, including the output projection."""
-        for parameter in self.parameters():
-            parameter.requires_grad = False
-        self._x3d_frozen = True
-        self.eval()
-
-    def unfreeze(self) -> None:
-        """Unfreeze the entire backbone for end-to-end fine-tuning."""
-        for parameter in self.parameters():
-            parameter.requires_grad = True
-        self._x3d_frozen = False
-        self.train()
-
-    def train(self, mode: bool = True):
-        """
-        Set train/eval mode while keeping a frozen X3D trunk in evaluation mode.
-
-        Freezing parameters alone is not enough for BatchNorm-based backbones:
-        their running statistics would otherwise continue to change when the full
-        pipeline is switched to training mode.
-        """
-        super().train(mode)
-        if self._x3d_frozen:
-            self.trunk.eval()
-        return self
-
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if x.dim() != 5:
             raise ValueError(
@@ -159,41 +152,25 @@ class X3DSBackbone(BaseBackbone):
 
         features = self.trunk(x)  # (B, 192, T, H', W')
 
-        if features.dim() != 5 or features.size(1) != self.NATIVE_OUT_DIM:
-            raise RuntimeError(
-                "Unexpected X3D-S trunk output shape. Expected channel dimension "
-                f"{self.NATIVE_OUT_DIM}, got {tuple(features.shape)}."
-            )
-
         # Spatial pooling only: preserve the temporal sequence for the neck.
         features = features.mean(dim=(-2, -1))  # (B, 192, T)
         features = features.transpose(1, 2).contiguous()  # (B, T, 192)
 
-        return self.projection(features)  # (B, T, out_dim)
-
-from typing import Optional
-import torch
-import torch.nn as nn
-
-from .base import BaseBackbone
+        return features  # (B, T, out_dim)
 
 
+@BackboneFactory.register(BackboneType.X3D_L)
 class X3DLBackbone(BaseBackbone):
-    NATIVE_OUT_DIM = 432
 
     def __init__(
         self,
-        out_dim: int = 432,
         pretrained: bool = True,
-        freeze_x3d: bool = True,
+        freeze_net: bool = True,
         progress: bool = True,
-        x3d_model: Optional[nn.Module] = None,
     ):
-        super().__init__(out_dim=out_dim)
+        super().__init__(out_dim=432, pretrained=pretrained, freeze_net=freeze_net)
 
-        model = x3d_model or self._load_x3d_l(
-            pretrained=pretrained, progress=progress
-        )
+        model = self._load_x3d_l(pretrained=pretrained, progress=progress)
         
         # 1. Trunk (Stage 0 -> Stage 4)
         self.trunk = nn.Sequential(*list(model.blocks[:-1]))
@@ -206,13 +183,7 @@ class X3DLBackbone(BaseBackbone):
             head_pool.pre_act
         )
 
-        self.projection = (
-            nn.Identity()
-            if out_dim == self.NATIVE_OUT_DIM
-            else nn.Linear(self.NATIVE_OUT_DIM, out_dim)
-        )
-
-        if freeze_x3d:
+        if freeze_net:
             self.freeze()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -224,7 +195,7 @@ class X3DLBackbone(BaseBackbone):
         x_feat = x_feat.mean(dim=(-2, -1))  # (B, 432, 16)
         x_feat = x_feat.permute(0, 2, 1).contiguous() # (B, 16, 432)
 
-        return self.projection(x_feat)
+        return x_feat
 
     @staticmethod
     def _load_x3d_l(pretrained: bool, progress: bool) -> nn.Module:
@@ -245,59 +216,26 @@ class X3DLBackbone(BaseBackbone):
                 "Provided x3d_model does not have a 'blocks' attribute."
             )
 
-    def freeze_x3d(self) -> None:
-        """Freeze the X3D-L trunk parameters and set BatchNorm layers to eval."""
-        for param in self.trunk.parameters():
-            param.requires_grad = False
-        self.trunk.eval()
-        self._x3d_frozen = True
-
-    def unfreeze_x3d(self) -> None:
-        """Unfreeze the X3D-L trunk parameters for fine-tuning."""
-        for param in self.trunk.parameters():
-            param.requires_grad = True
-        self._x3d_frozen = False
-
-    def freeze(self) -> None:
-        """Freeze the entire backbone."""
-        for param in self.parameters():
-            param.requires_grad = False
-        self._x3d_frozen = True
-        self.eval()
-
-    def unfreeze(self) -> None:
-        """Unfreeze the entire backbone."""
-        for param in self.parameters():
-            param.requires_grad = True
-        self._x3d_frozen = False
-        self.train()
-
-    def train(self, mode: bool = True) -> "X3DLBackbone":
-        super().train(mode)
-        if self._x3d_frozen:
-            self.trunk.eval()
-        return self
-
 
 from torchvision.models import convnext_tiny, ConvNeXt_Tiny_Weights
 
+@BackboneFactory.register(BackboneType.CONVNEXT_2D)
 class ConvNeXt2DBackbone(BaseBackbone):
     """
     Used for 2D spatial feature extraction (based on ConvNeXt-Tiny)
     Produces tensors of dimention 768 for each frame of the input sequence
     """
-    def __init__(self, pretrained: bool = True):
-        super().__init__(out_dim=768)
+    def __init__(self, pretrained: bool = True, freeze_net: bool = True):
+        super().__init__(out_dim=768, pretrained=pretrained, freeze_net=freeze_net)
         weights = ConvNeXt_Tiny_Weights.DEFAULT if pretrained else None
         model = convnext_tiny(weights=weights)
         
         self.features = model.features
         self.avgpool = model.avgpool
 
-    def freeze(self) -> None:
-        for param in self.parameters():
-            param.requires_grad = False
-        self.eval()
+        if freeze_net:
+            self.freeze()
+
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Input x: (B, C, T, H, W)
@@ -311,6 +249,7 @@ class ConvNeXt2DBackbone(BaseBackbone):
         return feat.view(B, T, self.out_dim)  # (B, T, 768)
 
 
+# Probably unused. To clean
 class Hybrid2D3DBackbone(BaseBackbone):
     """
     This wrapper combines the two previous backbone outputs (size 960)
@@ -346,7 +285,7 @@ import torch
 import torch.nn as nn
 import numpy as np
 
-
+# Probably unused. To refactor (other task)
 class BallTrackerBackbone(nn.Module):
     """
     Geometric ball feature extractor for video sequences.
@@ -570,7 +509,7 @@ class TSCIModule(nn.Module):
     Triplet Spatial-Channel Interaction (TSCI) Module.
     Models cross-dimensional Space-Channel interactions.
     """
-    def __init__(self, channels: int, kernel_size: int = 7):
+    def __init__(self, kernel_size: int = 7):
         super().__init__()
         padding = kernel_size // 2
         self.conv_spatial = nn.Sequential(
@@ -619,7 +558,7 @@ class ACABottleneck(nn.Module):
         
         in_channels = original_bottleneck.conv1.out_channels
         self.lsta = LSTAModule(channels=in_channels)
-        self.tsci = TSCIModule(channels=in_channels)
+        self.tsci = TSCIModule()
         
         self.conv2 = original_bottleneck.conv2
         self.bn2 = original_bottleneck.bn2
@@ -653,6 +592,7 @@ class ACABottleneck(nn.Module):
         return out
 
 
+@BackboneFactory.register(BackboneType.ACA_NET)
 class ACANetBackbone(BaseBackbone):
     """
     ACA-Net Backbone for spatio-temporal feature extraction from video.
@@ -662,15 +602,13 @@ class ACANetBackbone(BaseBackbone):
         pretrained (bool): Load ImageNet pre-trained weights for ResNet50.
         freeze_resnet (bool): Freeze the trunk parameters if set to True.
     """
-    NATIVE_OUT_DIM = 2048
 
     def __init__(
         self,
-        out_dim: int = 512,
         pretrained: bool = True,
-        freeze_resnet: bool = False,
+        freeze_resnet: bool = True,
     ):
-        super().__init__(out_dim=out_dim)
+        super().__init__(out_dim=2048, pretrained=pretrained, freeze_net=freeze_resnet)
         
         weights = ResNet50_Weights.DEFAULT if pretrained else None
         base_resnet = resnet50(weights=weights)
@@ -690,14 +628,7 @@ class ACANetBackbone(BaseBackbone):
         self.layer4 = self._wrap_layer(base_resnet.layer4)
         
         self.avgpool = base_resnet.avgpool
-        
-        # Optional projection if out_dim != 2048
-        self.projection = (
-            nn.Identity()
-            if out_dim == self.NATIVE_OUT_DIM
-            else nn.Linear(self.NATIVE_OUT_DIM, out_dim)
-        )
-        
+
         if freeze_resnet:
             self.freeze()
 
@@ -706,17 +637,6 @@ class ACANetBackbone(BaseBackbone):
         for block in layer:
             wrapped_blocks.append(ACABottleneck(block))
         return wrapped_blocks
-
-    def freeze(self) -> None:
-        
-        for param in self.parameters():
-            param.requires_grad = False
-        self.eval()
-
-    def unfreeze(self) -> None:
-        for param in self.parameters():
-            param.requires_grad = True
-        self.train()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if x.dim() != 5:
@@ -740,9 +660,10 @@ class ACANetBackbone(BaseBackbone):
         feat = torch.flatten(feat, 1)       # (B*T, 2048)
         feat = feat.view(B, T, 2048)        # (B, T, 2048)
         
-        return self.projection(feat)        # (B, T, out_dim)
+        return feat
 
 
+@BackboneFactory.register(BackboneType.VIDEO_SWIN)
 class VideoSwinBackbone(BaseBackbone):
     """
     Video Swin Transformer backbone (Swin3D-Tiny).
@@ -752,15 +673,13 @@ class VideoSwinBackbone(BaseBackbone):
     Supports video input (B, C, T, H, W) and temporally realigns (via 1D interpolation) 
     the output features to return the same length T as the input (B, T, out_dim).
     """
-    NATIVE_OUT_DIM = 768  # Output channel dimension from swin3d_t feature block
 
     def __init__(
         self,
-        out_dim: int = 512,
         pretrained: bool = True,
-        freeze_swin: bool = False,
+        freeze_net: bool = True,
     ):
-        super().__init__(out_dim=out_dim)
+        super().__init__(out_dim=768, pretrained=pretrained, freeze_net=freeze_net)
         
         weights = Swin3D_T_Weights.DEFAULT if pretrained else None
         model = swin3d_t(weights=weights)
@@ -769,27 +688,8 @@ class VideoSwinBackbone(BaseBackbone):
         self.features = model.features
         self.norm = model.norm
         
-        # Optional projection to align the requested out_dim (default 512)
-        self.projection = (
-            nn.Identity()
-            if out_dim == self.NATIVE_OUT_DIM
-            else nn.Linear(self.NATIVE_OUT_DIM, out_dim)
-        )
-        
-        if freeze_swin:
+        if freeze_net:
             self.freeze()
-            
-    def freeze(self) -> None:
-        """Freezes the backbone parameters."""
-        for param in self.parameters():
-            param.requires_grad = False
-        self.eval()
-        
-    def unfreeze(self) -> None:
-        """Unfreezes the parameters for training."""
-        for param in self.parameters():
-            param.requires_grad = True
-        self.train()
         
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if x.dim() != 5:
@@ -814,10 +714,10 @@ class VideoSwinBackbone(BaseBackbone):
         if T_out != T_in:
             feat = F.interpolate(feat, size=T_in, mode="linear", align_corners=False)
             
-        # Permute to (B, T, D) and final projection
+        # Permute to (B, T, D)
         feat = feat.transpose(1, 2).contiguous() # (B, T_in, 768)
         
-        return self.projection(feat) # (B, T_in, out_dim)
+        return feat # (B, T_in, out_dim)
 
 #Checkpoint UniFormer-XXS addestrato su Kinetics-400 (16 frame)
 UNIFORMER_XXS_K400_URL = "https://github.com/SenseTime-Research/UniFormer/releases/download/v1.0/uniformer_xxs_k400_16x4.pth"
@@ -930,6 +830,7 @@ class PatchEmbed3D(nn.Module):
         return self.norm(x)
 
 
+@BackboneFactory.register(BackboneType.UNIFORMER_XXS)
 class UniFormerXXSBackbone(BaseBackbone):
     """
     Backbone UniFormer-XXS.
@@ -943,12 +844,10 @@ class UniFormerXXSBackbone(BaseBackbone):
     def __init__(
         self,
         pretrained: bool = True,
-        weights_url: str = UNIFORMER_XXS_K400_URL,
+        freeze_net: bool = True,
         in_channels: int = 3,
-        out_dim: int = 512
     ):
-        super().__init__()
-        self.out_dim = out_dim
+        super().__init__(out_dim=512, pretrained=pretrained, freeze_net=freeze_net)
 
         # UniFormer-XXS configuration
         depths = [3, 4, 8, 3]
@@ -983,7 +882,7 @@ class UniFormerXXSBackbone(BaseBackbone):
 
         # Loading pre-trained weights
         if pretrained:
-            self._load_pretrained_weights(weights_url)
+            self._load_pretrained_weights(UNIFORMER_XXS_K400_URL)
 
     def _load_pretrained_weights(self, url: str):
         print(f"Downloading/Loading pre-trained weights from {url}...")
