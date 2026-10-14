@@ -3,3 +3,5 @@ experiments*
 .venv/*
 dataset/*
 features/*
+dataset_hd/*
+*.zip

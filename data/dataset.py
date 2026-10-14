@@ -1,6 +1,12 @@
 import torch
 from torch.utils.data import Dataset
 from typing import List, Dict, Any, Optional, Callable
+from .temporal_sampling import (
+    FixedFPSSampler,
+    LegacyUniformSampler,
+    PreserveAllSampler,
+    TemporalSampler,
+)
 
 
 phase_1_labels = {}
@@ -17,8 +23,9 @@ class ActionRecognitionDataset(Dataset):
                 - "data": Tensor of raw video (C, T, H, W) or features (T, D), or path string.
                 - "label": Integer class target.
                 - "num_frames" (Optional): Total frame count of the clip.
-        sampling_strategy (str, optional): Temporal frame selection strategy.
-            Supported values are 'uniform' and 'fixed_fps'. Defaults to "uniform".
+        sampling_strategy (str, optional): Backward-compatible selector for
+            'uniform' or 'fixed_fps'. If omitted, raw video tensors use the
+            legacy uniform sampler and pre-extracted features are preserved.
         num_sampled_frames (int, optional): Fixed number of frames to sample when using 
             'uniform' strategy. Defaults to 16.
         target_fps (float, optional): Desired frame rate when using 'fixed_fps' strategy. 
@@ -28,8 +35,11 @@ class ActionRecognitionDataset(Dataset):
             spatial data augmentation on raw video frames (C, T, H, W). Defaults to None.
         temporal_shift (Optional[Callable], optional): Transformation function for 
             temporal data augmentation/shifting on sampled frame indices. Defaults to None.
-        is_feature_dataset (bool, optional): Flag indicating whether the dataset holds 
-            3D pre-extracted feature tensors (True) or raw video frames (False). Defaults to False.
+        is_feature_dataset (bool, optional): Flag indicating whether the dataset holds
+            3D pre-extracted feature tensors (True) or raw video frames (False).
+            Defaults to False.
+        temporal_sampler (TemporalSampler, optional): Explicit temporal sampling
+            policy. If omitted for pre-extracted features, all stored steps are kept.
 
     Example:
         >>> # Usage 1: Raw Video Dataset (5D Tensors)
@@ -65,42 +75,48 @@ class ActionRecognitionDataset(Dataset):
     def __init__(
         self,
         samples: List[Dict[str, Any]],
-        sampling_strategy: str = "uniform",
+        sampling_strategy: Optional[str] = None,
         num_sampled_frames: int = 16,
         target_fps: float = 15.0,
         original_fps: float = 30.0,
         spatial_transform: Optional[Callable] = None,
         temporal_shift: Optional[Callable] = None,
-        is_feature_dataset: bool = False
+        is_feature_dataset: bool = False,
+        temporal_sampler: Optional[TemporalSampler] = None,
     ):
         self.samples = samples
-        self.sampling_strategy = sampling_strategy
-        self.num_sampled_frames = num_sampled_frames
-        self.step_ratio = max(1, int(original_fps / target_fps))
+        self.original_fps = original_fps
         self.spatial_transform = spatial_transform
         self.temporal_shift = temporal_shift
         self.is_feature_dataset = is_feature_dataset
+
+        if temporal_sampler is not None:
+            self.temporal_sampler = temporal_sampler
+        elif is_feature_dataset and sampling_strategy is not None:
+            raise ValueError(
+                "Pre-extracted features must keep their stored temporal steps. "
+                "Pass an explicit temporal_sampler only when resampling is intentional."
+            )
+        elif sampling_strategy == "fixed_fps":
+            self.temporal_sampler = FixedFPSSampler(target_fps)
+        elif sampling_strategy in (None, "uniform"):
+            self.temporal_sampler = (
+                PreserveAllSampler()
+                if is_feature_dataset and sampling_strategy is None
+                else LegacyUniformSampler(num_sampled_frames)
+            )
+        else:
+            raise ValueError(f"Unsupported sampling strategy: {sampling_strategy}")
 
     def __len__(self) -> int:
         return len(self.samples)
 
     def _get_sampled_indices(self, total_frames: int) -> List[int]:
-        """Calculates frame indices based on the selected temporal sampling strategy."""
-        if self.sampling_strategy == "uniform":
-            if total_frames >= self.num_sampled_frames:
-                # Uniform step sampling across the temporal dimension
-                stride = total_frames / float(self.num_sampled_frames)
-                indices = [int(i * stride) for i in range(self.num_sampled_frames)]
-            else:
-                # Edge-padding / Last frame repetition for short clips (L < N)
-                indices = list(range(total_frames))
-                last_idx = total_frames - 1
-                indices.extend([last_idx] * (self.num_sampled_frames - total_frames))
-                
-        elif self.sampling_strategy == "fixed_fps":
-            indices = list(range(0, total_frames, self.step_ratio))
-        else:
-            raise ValueError(f"Unsupported sampling strategy: {self.sampling_strategy}")
+        """Use the injected temporal policy, or preserve all feature steps."""
+        indices = self.temporal_sampler.sample_indices(
+            total_frames,
+            fps=self.original_fps,
+        )
 
         if self.temporal_shift is not None:
             indices = self.temporal_shift(indices, total_frames)
@@ -132,7 +148,12 @@ class ActionRecognitionDataset(Dataset):
         else:                         label_p3 = -1 
 
         data_source = item["data"]
-        total_frames = item.get("num_frames", data_source.shape[0] if self.is_feature_dataset else data_source.shape[1])
+        # The tensor shape is authoritative; payload metadata may be stale.
+        total_frames = (
+            data_source.shape[0]
+            if self.is_feature_dataset
+            else data_source.shape[1]
+        )
 
         indices = self._get_sampled_indices(total_frames)
         valid_length = len(indices)

@@ -15,6 +15,14 @@ class VideoRandomHorizontalFlip:
         return clip
 
 
+# Deterministic flip used by the feature extraction script.
+class VideoHorizontalFlip:
+    """Deterministically flip every frame horizontally."""
+
+    def __call__(self, clip: torch.Tensor) -> torch.Tensor:
+        return torch.flip(clip, dims=[-1])
+
+
 class VideoColorJitter:
     def __init__(self, brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1, p: float = 0.5):
         self.p = p
@@ -45,4 +53,6 @@ class RandomTemporalShift:
         
         shift = random.randint(-self.shift_range, self.shift_range)
         shifted_indices = [max(0, min(total_frames - 1, idx + shift)) for idx in indices]
+        if len(set(shifted_indices)) != len(shifted_indices):
+            return indices
         return shifted_indices

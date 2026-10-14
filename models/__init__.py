@@ -10,14 +10,14 @@ __all__ = [
     "BaseTemporalNeck",
     "BaseClassifierHead",
     "X3DSBackbone",
-    "X3DLBackbone"
+    "X3DLBackbone",
     "ConvNeXt2DBackbone",
-    "CompositeBackbone"
+    "CompositeBackbone",
     "IdentityNeck",
     "BiGRUNeck",
     "TCNNeck",
     "MeanPoolingClassifierHead",
-    "AttentionClassifierHead"
+    "AttentionClassifierHead",
     "ARPipeline",
     "Trainer"
 ]

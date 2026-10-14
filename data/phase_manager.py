@@ -34,7 +34,7 @@ def prepare_phase_data(
     train_loader = DataLoader(
         train_dataset,
         batch_sampler=BucketSampler(
-            sequence_lengths=[s["num_frames"] for s in train_filtered],
+            sequence_lengths=[s["data"].shape[0] for s in train_filtered],
             batch_size=batch_size,
         ),
         collate_fn=pad_and_collate_video_batch,

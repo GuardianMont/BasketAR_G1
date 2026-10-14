@@ -14,7 +14,11 @@ class BaseBackbone(nn.Module, ABC):
         self.out_dim = out_dim
 
     @abstractmethod
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        lengths: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         pass
 
 

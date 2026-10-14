@@ -13,6 +13,19 @@ from data.phase_manager import PHASE_CONFIGS, prepare_phase_data
 from models.trainer import Trainer
 from models.heads import AttentionClassifierHead
 from models.necks import TCNNeck
+from sklearn.metrics import accuracy_score, f1_score
+from torch.utils.data import DataLoader
+from tqdm import tqdm
+
+# Module imports
+from data.dataset import ActionRecognitionDataset
+from data.experiment_config import ExperimentConfig
+from data.samplers import BucketSampler
+from data.temporal_sampling import LegacyUniformSampler
+from data.utils import compute_class_weights, pad_and_collate_video_batch
+from losses import FocalLoss
+from models.heads import AttentionClassifierHead, MeanPoolingClassifierHead
+from models.necks import BiGRUNeck, IdentityNeck, TCNNeck
 from models.pipeline import ARPipeline
 from utils.feature_loader import FeatureLoader
 from utils.logger import ExperimentLogger
@@ -44,6 +57,25 @@ DEFAULT_COMPONENTS = {
 DEFAULT_GRID = {"lr": [1e-3]}
 
 # Dataset descriptions
+BASELINE_FEATURE_CONFIG = ExperimentConfig(
+    sampler=LegacyUniformSampler(16).config(),
+    spatial_mode="letterbox",
+    spatial_size=312,
+    color="rgb",
+    backbone="x3d_l",
+    tracker="none",
+    extra={"transform": "none"},
+)
+TRACKER_FEATURE_CONFIG = ExperimentConfig(
+    sampler=LegacyUniformSampler(16).config(),
+    spatial_mode="letterbox",
+    spatial_size=312,
+    color="rgb",
+    backbone="x3d_l",
+    tracker="yolov8n_coco",
+    extra={"transform": "none"},
+)
+
 DATA_CONFIGS = {
     "DATA-01_Solo3D": (
         "3D Spatio-Temporal Features (X3D-L)",
@@ -70,6 +102,56 @@ EXPERIMENTS = {
     }
     for key, (desc, train_path, val_path, dim) in DATA_CONFIGS.items()
 }
+
+
+def build_dataloaders_for_phase(train_samples, val_samples, phase: str):
+    """Filters dataset samples by phase constraints and creates DataLoaders."""
+    p_cfg = PHASE_CONFIGS[phase]
+
+    if p_cfg["filter_shots_only"]:
+        train_filtered = [
+            s for s in train_samples if s["label"] in [1, 2, 3, 4, 5, 6]
+        ]
+        val_filtered = [
+            s for s in val_samples if s["label"] in [1, 2, 3, 4, 5, 6]
+        ]
+    else:
+        train_filtered = train_samples
+        val_filtered = val_samples
+
+    train_dataset = ActionRecognitionDataset(
+        samples=train_filtered, is_feature_dataset=True
+    )
+    val_dataset = ActionRecognitionDataset(
+        samples=val_filtered, is_feature_dataset=True
+    )
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_sampler=BucketSampler(
+            sequence_lengths=[int(s["data"].shape[0]) for s in train_filtered],
+            batch_size=8,
+        ),
+        collate_fn=pad_and_collate_video_batch,
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=8,
+        shuffle=False,
+        collate_fn=pad_and_collate_video_batch,
+    )
+
+    target_key = f"label_{phase}"
+    train_phase_labels = [
+        train_dataset[i][target_key] for i in range(len(train_dataset))
+    ]
+    class_weights = compute_class_weights(
+        train_phase_labels,
+        num_classes=p_cfg["num_classes"],
+        method="inverse",
+    )
+
+    return train_loader, val_loader, class_weights
 
 
 def train_single_phase(
