@@ -338,119 +338,6 @@ class Hybrid2D3DBackbone(BaseBackbone):
         return torch.cat([f3d, f2d], dim=-1)  # (B, T, 960)
 
 
-import torch
-import torch.nn as nn
-import numpy as np
-
-
-class BallTrackerBackbone(nn.Module):
-    """
-    Estrattore di feature geometriche della palla per sequenze video.
-    Utilizza la rete YOLOv8n (COCO) in inferenza pura via AutoBackend,
-    prevenendo al 100% l'attivazione dell'engine Trainer.
-    """
-
-    def __init__(
-        self,
-        model_path: str = "yolov8n.pt",
-        confidence_threshold: float = 0.20,
-        device: str = "cuda" if torch.cuda.is_available() else "cpu",
-    ):
-        super().__init__()
-        from ultralytics.nn.autobackend import AutoBackend
-
-        # Carichiamo l'AutoBackend nativo: e' un modulo PyTorch puro senza logica di training
-        self.device = torch.device(device)
-        self.model = AutoBackend(model=model_path, device=self.device)
-        self.model.eval()
-
-        # Congeliamo tutti i parametri
-        for param in self.model.parameters():
-            param.requires_grad = False
-
-        self.conf_thresh = confidence_threshold
-        self.ball_class_id = 32  # ID per 'sports ball' in COCO
-        self.out_dim = 5  # [x_norm, y_norm, dx, dy, confidence]
-
-    def freeze(self) -> None:
-        """Imposta il modello in modalità eval."""
-        self.eval()
-        self.model.eval()
-
-    def flip_ball_tracking_coords(coords: torch.Tensor) -> torch.Tensor:
-        """
-        Flips tracking coordinates if the Video Flip augmentation has been applied.
-        """
-        coords_flipped = coords.clone()
-        coords_flipped[:, 0] = 1.0 - coords_flipped[:, 0]
-        coords_flipped[:, 2] = -coords_flipped[:, 2]
-        return coords_flipped
-
-    @torch.no_grad()
-    def _track_single_clip(self, clip_tensor: torch.Tensor) -> torch.Tensor:
-        """
-        Processa una singola clip (C, T, H, W) con valori float in [0, 1].
-        """
-        C, T, H, W = clip_tensor.shape
-        
-        # Prepara il batch di frame direttamente come tensore PyTorch: (T, C, 640, 640)
-        # Permuta da (C, T, H, W) -> (T, C, H, W)
-        batch_frames = clip_tensor.permute(1, 0, 2, 3).to(self.device)
-
-        # Rescale automatico a 640x640 per YOLO
-        if H != 640 or W != 640:
-            batch_frames = torch.nn.functional.interpolate(
-                batch_frames, size=(640, 640), mode="bilinear", align_corners=False
-            )
-
-        # Passaggio forward diretto su AutoBackend (Niente Trainer, niente callback)
-        preds = self.model(batch_frames)
-        if isinstance(preds, (list, tuple)):
-            preds = preds[0]
-
-        coords = []
-        prev_x, prev_y = 0.5, 0.5  # Fallback al centro se non rilevata
-
-        # Processa le predizioni per ciascuno dei T frame
-        for t in range(T):
-            pred_frame = preds[t]  # (84, 8400)
-            
-            boxes = pred_frame[:4, :].transpose(0, 1)  # (8400, 4) -> [cx, cy, w, h] in pixel
-            scores = pred_frame[4 + self.ball_class_id, :]  # (8400,) score classe 32
-
-            mask = scores >= self.conf_thresh
-
-            if mask.any():
-                valid_scores = scores[mask]
-                valid_boxes = boxes[mask]
-                
-                best_idx = torch.argmax(valid_scores)
-                best_conf = float(valid_scores[best_idx].cpu().item())
-                best_box = valid_boxes[best_idx].cpu().numpy()
-
-                # Normalizzazione coordinate in [0, 1]
-                curr_x = float(best_box[0] / 640.0)
-                curr_y = float(best_box[1] / 640.0)
-                max_conf = best_conf
-            else:
-                curr_x, curr_y = prev_x, prev_y
-                max_conf = 0.0
-
-            dx = curr_x - prev_x
-            dy = curr_y - prev_y
-
-            coords.append([curr_x, curr_y, dx, dy, max_conf])
-            prev_x, prev_y = curr_x, curr_y
-
-        return torch.tensor(coords, dtype=torch.float32)  # (T, 5)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x shape: (B, C, T, H, W)
-        B = x.shape[0]
-        batch_coords = [self._track_single_clip(x[b]) for b in range(B)]
-        return torch.stack(batch_coords, dim=0).to(x.device)
-    
-
 from typing import List
 
 
@@ -486,11 +373,6 @@ class CompositeBackbone(nn.Module):
         return torch.cat(features, dim=-1)  # (B, T, D_totale)
 
     def forward_dual(self, x_norm: torch.Tensor, x_raw: torch.Tensor) -> torch.Tensor:
-        features = []
-        for b in self.backbones:
-            if isinstance(b, BallTrackerBackbone):
-                features.append(b(x_raw))
-            else:
-                features.append(b(x_norm))
-        return torch.cat(features, dim=-1)
+        """Compatibilità con il valutatore a due input: qui usa solo X3D normalizzato."""
+        return self.forward(x_norm)
 

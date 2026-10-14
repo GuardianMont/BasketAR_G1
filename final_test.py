@@ -484,7 +484,7 @@ def resolve_evaluation_preprocessing(args, experiment_config=None):
 
 
 def resolve_backbone_config(args, experiment_config=None):
-    """Resolve backbone and tracker from experiment metadata or CLI settings."""
+    """Resolve the video backbone from experiment metadata or CLI settings."""
     if args.feature_reference:
         if experiment_config is None:
             _, experiment_config = load_feature_reference(args.feature_reference)
@@ -508,13 +508,14 @@ def resolve_backbone_config(args, experiment_config=None):
                 f"{experiment_config['backbone']!r}."
             )
         tracker = experiment_config["tracker"]
-        tracker_streams = {"none": "3d", "yolov8n_coco": "3d_tracker"}
-        if not isinstance(tracker, str) or tracker not in tracker_streams:
+        if tracker != "none":
             raise ValueError(
-                f"Tracker non supportato nel file di riferimento: {tracker!r}."
+                f"Il tracker integrato nel backbone è stato rimosso; valore nel "
+                f"file di riferimento: {tracker!r}. Le nuove feature ball/rim "
+                "si estraggono offline e non sono ancora integrate in final_test.py."
             )
         backbone_type = backbone_types[backbone_value]
-        feature_stream = tracker_streams[tracker]
+        feature_stream = "3d"
         config_source = str(args.feature_reference)
     else:
         backbone_type = args.backbone_type
@@ -522,7 +523,7 @@ def resolve_backbone_config(args, experiment_config=None):
         config_source = "argomenti CLI"
         if backbone_type not in {"X3D-L", "X3D-S"}:
             raise ValueError(f"Unsupported backbone type: {backbone_type}")
-        if feature_stream not in {"3d", "3d_tracker"}:
+        if feature_stream != "3d":
             raise ValueError(f"Unsupported feature stream: {feature_stream}")
 
     return {
@@ -566,8 +567,8 @@ def main():
     parser.add_argument("--backbone-type", choices=["X3D-L", "X3D-S"], default="X3D-L")
     parser.add_argument(
         "--feature-stream",
-        choices=["3d", "3d_tracker"],
-        default="3d_tracker",
+        choices=["3d"],
+        default="3d",
     )
     parser.add_argument("--checkpoint-p1", default=BEST_CHECKPOINTS["p1"])
     parser.add_argument("--checkpoint-p2", default=BEST_CHECKPOINTS["p2"])
