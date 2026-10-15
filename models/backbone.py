@@ -711,10 +711,8 @@ class VideoSwinBackbone(BaseBackbone):
         
         return feat # (B, T', out_dim)
 
-#Checkpoint UniFormer-XXS addestrato su Kinetics-400 (16 frame)
-UNIFORMER_XXS_K400_URL = "https://github.com/SenseTime-Research/UniFormer/releases/download/v1.0/uniformer_xxs_k400_16x4.pth"
-UNIFORMER_XXS_224 = "weights/uniformer_xxs_224_in1k.pth"
-UNIFORMER_XXS_128 = "weights/uniformer_xxs_128_in1k.pth"
+#Checkpoint UniFormer-XXS trained on Kinetics-400 (16 frame)
+UNIFORMER_XXS_160_K400 = "weights/uniformer_xxs16_160_k400.pth"
 
 class DynamicPositionEmbedding(nn.Module):
     """Dynamic Position Embedding (DPE) with 3D Depthwise Convolution."""
@@ -728,7 +726,6 @@ class DynamicPositionEmbedding(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: [B, C, T, H, W]
         return x + self.dwconv(x)
-
 
 class LocalMHRA(nn.Module):
     """Multi-Head Relation Aggregator for superficial stages (Local Convolutions)."""
@@ -760,7 +757,7 @@ class GlobalMHRA(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, C, T, H, W = x.shape
-        N = T * H * W
+        N = T * H * W # total number of token temporal-space
 
         x_flat = x.permute(0, 2, 3, 4, 1).reshape(B, N, C)
         qkv = self.qkv(x_flat).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
@@ -784,7 +781,6 @@ class FFN(nn.Module):
         self.fc2 = nn.Linear(hidden_features, in_features)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        B, C, T, H, W = x.shape
         x_flat = x.permute(0, 2, 3, 4, 1)
         x_flat = self.fc1(x_flat)
         x_flat = self.act(x_flat)
@@ -828,22 +824,16 @@ class PatchEmbed3D(nn.Module):
 class UniFormerXXSBackbone(BaseBackbone):
     """
     Backbone UniFormer-XXS.
-    
-    Architettural specifications:
-    - Depths: [3, 4, 8, 3]
-    - Embed Dims: [64, 128, 320, 512]
-    - Number of Heads: [1, 2, 5, 8]
-    - Parameters: ~10.2M - 10.4M
     """
     def __init__(
         self,
         pretrained: bool = True,
+        weights_path: str = UNIFORMER_XXS_160_K400,
         freeze_net: bool = True,
         in_channels: int = 3,
     ):
         super().__init__(out_dim=512, pretrained=pretrained, freeze_net=freeze_net)
 
-        # UniFormer-XXS configuration
         depths = [3, 4, 8, 3]
         embed_dims = [64, 128, 320, 512]
         num_heads = [1, 2, 5, 8]
@@ -876,39 +866,44 @@ class UniFormerXXSBackbone(BaseBackbone):
 
         # Loading pre-trained weights
         if pretrained:
-            self._load_pretrained_weights(UNIFORMER_XXS_128)
+            self._load_k400_weights(weights_path)
 
-    def _load_pretrained_weights(self, weights_path_or_url: str):
-        """Carica i pesi da un file locale .pth/.pt o da URL se valido."""
-        if os.path.exists(weights_path_or_url):
-            print(f"Loading pre-trained weights from local file: {weights_path_or_url}")
-            checkpoint = torch.load(weights_path_or_url, map_location="cpu", weights_only=False)
-        elif weights_path_or_url.startswith("http://") or weights_path_or_url.startswith("https://"):
-            print(f"Downloading/Loading pre-trained weights from {weights_path_or_url}...")
-            checkpoint = torch.hub.load_state_dict_from_url(
-                weights_path_or_url, progress=True, map_location="cpu"
-            )
-        else:
-            raise FileNotFoundError(
-                f"Pretrained weights file not found at '{weights_path_or_url}' and it is not a valid URL."
-            )
+        if freeze_net:
+            self.freeze()
 
-        # Estrazione del dictionary di pesi gestendo eventuali wrapper (es. 'model', 'state_dict', ecc.)
-        state_dict = checkpoint.get("model", checkpoint.get("state_dict", checkpoint))
-        
-        cleaned_state_dict = {}
-        for key, value in state_dict.items():
-            new_key = key.replace("backbone.", "").replace("module.", "")
-            if new_key.startswith("head.") or new_key.startswith("fc."):
-                continue
+    def _load_k400_weights(self, weights_path: str):
+            if not os.path.exists(weights_path):
+                print(f"[WARNING] Weights file not found at '{weights_path}'. Randomly initializing parameters.")
+                return
+    
+            print(f"[INFO] Loading pre-trained Kinetics-400 weights from: {weights_path}")
+            checkpoint = torch.load(weights_path, map_location="cpu")
+            raw_state_dict = checkpoint.get("model", checkpoint.get("state_dict", checkpoint))
+    
+            mapped_state_dict = {}
+            for key, value in raw_state_dict.items():
+                new_key = key.replace("backbone.", "").replace("module.", "")
+    
+                if new_key.startswith("head.") or new_key.startswith("fc.") or new_key.startswith("projection."):
+                    continue
+    
+                for i in range(1, 5):
+                    new_key = new_key.replace(f"blocks{i}.", f"stage{i}.")
+                    new_key = new_key.replace(f"blocks.{i-1}.", f"stage{i}.")
+    
+               # Submodule mapping
+                new_key = new_key.replace("mlp.", "ffn.")
+                new_key = new_key.replace("attn.", "mhra.")
+                new_key = new_key.replace("pos_embed.", "dpe.")
+    
+                mapped_state_dict[new_key] = value
+    
+            # Loading with strict=False to ignore the classification head of the source dataset
+            missing, unexpected = self.load_state_dict(mapped_state_dict, strict=False)
+            print(f"[SUCCESS] Kinetics-400 weights loaded successfully!")
+            print(f"  - Missing keys (typically just Head/FC): {len(missing)}")
+            print(f"  - Unexpected keys: {len(unexpected)}")
             
-            for i in range(1, 5):
-                new_key = new_key.replace(f"blocks{i}.", f"stage{i}.")
-                
-            cleaned_state_dict[new_key] = value
-
-        missing, unexpected = self.load_state_dict(cleaned_state_dict, strict=False)
-        print(f"Weights loaded successfully! Missing keys: {len(missing)}, Unexpected keys: {len(unexpected)}")
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -936,7 +931,7 @@ class UniFormerXXSBackbone(BaseBackbone):
         for blk in self.stage4:
             x = blk(x)
 
-        x = self.norm(x)  # Shape: [B, D, T, H', W'] -> es: [B, 512, 16, 7, 7]
+        x = self.norm(x)  # Shape: [B, D, T, H', W'] 
 
         # Global Average Pooling on dimensions H and W
         x = torch.mean(x, dim=(-2, -1))  # Shape: [B, D, T]
