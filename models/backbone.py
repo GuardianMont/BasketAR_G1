@@ -711,245 +711,322 @@ class VideoSwinBackbone(BaseBackbone):
         
         return feat # (B, T', out_dim)
 
-#Checkpoint UniFormer-XXS trained on Kinetics-400 (16 frame)
+"""
+The following code implements the UniFormer-XXS Backbone natively adapted from Sense-X official implementation.
+Adapted from:
+    https://github.com/Sense-X/UniFormer/blob/main/video_classification/slowfast/models/uniformer_light.py
+"""
+
 UNIFORMER_XXS_160_K400 = "weights/uniformer_xxs16_160_k400.pth"
 
-class DynamicPositionEmbedding(nn.Module):
-    """Dynamic Position Embedding (DPE) with 3D Depthwise Convolution."""
-    def __init__(self, dim: int, kernel_size: tuple = (3, 3, 3)):
+from functools import partial
+from timm.models.layers import trunc_normal_, DropPath, to_2tuple
+
+def conv_3xnxn(inp, oup, kernel_size=3, stride=3, groups=1):
+    return nn.Conv3d(inp, oup, (3, kernel_size, kernel_size), (2, stride, stride), (1, 0, 0), groups=groups)
+    
+def conv_1xnxn(inp, oup, kernel_size=3, stride=3, groups=1):
+    return nn.Conv3d(inp, oup, (1, kernel_size, kernel_size), (1, stride, stride), (0, 0, 0), groups=groups)
+
+def conv_1x1x1(inp, oup, groups=1):
+    return nn.Conv3d(inp, oup, (1, 1, 1), (1, 1, 1), (0, 0, 0), groups=groups)
+
+def conv_3x3x3(inp, oup, groups=1):
+    return nn.Conv3d(inp, oup, (3, 3, 3), (1, 1, 1), (1, 1, 1), groups=groups)
+
+def conv_5x5x5(inp, oup, groups=1):
+    return nn.Conv3d(inp, oup, (5, 5, 5), (1, 1, 1), (2, 2, 2), groups=groups)
+
+def bn_3d(dim):
+    return nn.BatchNorm3d(dim)
+
+
+class Mlp(nn.Module):
+    def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, drop=0.):
         super().__init__()
-        padding = (kernel_size[0] // 2, kernel_size[1] // 2, kernel_size[2] // 2)
-        self.dwconv = nn.Conv3d(
-            dim, dim, kernel_size=kernel_size, stride=1, padding=padding, groups=dim
+        out_features = out_features or in_features
+        hidden_features = hidden_features or in_features
+        self.fc1 = nn.Linear(in_features, hidden_features)
+        self.act = act_layer()
+        self.fc2 = nn.Linear(hidden_features, out_features)
+        self.drop = nn.Dropout(drop)
+
+    def forward(self, x):
+        x = self.fc1(x)
+        x = self.act(x)
+        x = self.drop(x)
+        x = self.fc2(x)
+        x = self.drop(x)
+        return x
+
+class Attention(nn.Module):
+    def __init__(self, dim, num_heads=8, qkv_bias=False, qk_scale=None, attn_drop=0., proj_drop=0.):
+        super().__init__()
+        self.num_heads = num_heads
+        head_dim = dim // num_heads
+        self.scale = qk_scale or head_dim ** -0.5
+
+        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.proj = nn.Linear(dim, dim)
+        self.proj_drop = nn.Dropout(proj_drop)
+
+    def forward(self, x):
+        B, N, C = x.shape
+        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+
+        attn = (q @ k.transpose(-2, -1)) * self.scale
+        attn = attn.softmax(dim=-1)
+        attn = self.attn_drop(attn)
+
+        x = (attn @ v).transpose(1, 2).reshape(B, N, C)
+        x = self.proj(x)
+        x = self.proj_drop(x)
+        return x
+
+class CMlp(nn.Module):
+    def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, drop=0.):
+        super().__init__()
+        out_features = out_features or in_features
+        hidden_features = hidden_features or in_features
+        self.fc1 = conv_1x1x1(in_features, hidden_features)
+        self.act = act_layer()
+        self.fc2 = conv_1x1x1(hidden_features, out_features)
+        self.drop = nn.Dropout(drop)
+
+    def forward(self, x):
+        x = self.fc1(x)
+        x = self.act(x)
+        x = self.drop(x)
+        x = self.fc2(x)
+        x = self.drop(x)
+        return x
+    
+class CBlock(nn.Module):
+    def __init__(self, dim, num_heads, mlp_ratio=4., qkv_bias=False, qk_scale=None, drop=0., attn_drop=0.,
+                 drop_path=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm):
+        super().__init__()
+        self.pos_embed = conv_3x3x3(dim, dim, groups=dim)
+        self.norm1 = bn_3d(dim)
+        self.conv1 = conv_1x1x1(dim, dim, 1)
+        self.conv2 = conv_1x1x1(dim, dim, 1)
+        self.attn = conv_5x5x5(dim, dim, groups=dim)
+        self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
+        self.norm2 = bn_3d(dim)
+        mlp_hidden_dim = int(dim * mlp_ratio)
+        self.mlp = CMlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
+
+    def forward(self, x):
+        x = x + self.pos_embed(x)
+        x = x + self.drop_path(self.conv2(self.attn(self.conv1(self.norm1(x)))))
+        x = x + self.drop_path(self.mlp(self.norm2(x)))
+        return x   
+
+class SABlock(nn.Module):
+    def __init__(self, dim, num_heads, mlp_ratio=4., qkv_bias=False, qk_scale=None, drop=0., attn_drop=0.,
+                 drop_path=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm):
+        super().__init__()
+        self.pos_embed = conv_3x3x3(dim, dim, groups=dim)
+        self.norm1 = norm_layer(dim)
+        self.attn = Attention(
+            dim, num_heads=num_heads, qkv_bias=qkv_bias, qk_scale=qk_scale,
+            attn_drop=attn_drop, proj_drop=drop)
+        self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
+        self.norm2 = norm_layer(dim)
+        mlp_hidden_dim = int(dim * mlp_ratio)
+        self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
+
+    def forward(self, x):
+        x = x + self.pos_embed(x)
+        B, C, T, H, W = x.shape
+        x = x.flatten(2).transpose(1, 2)
+        x = x + self.drop_path(self.attn(self.norm1(x)))
+        x = x + self.drop_path(self.mlp(self.norm2(x)))
+        x = x.transpose(1, 2).reshape(B, C, T, H, W)
+        return x    
+
+class SpeicalPatchEmbed(nn.Module):
+    def __init__(self, in_chans: int = 3, embed_dim: int = 56):
+        super().__init__()
+        
+        self.proj = nn.Sequential(
+            nn.Conv3d(in_chans, embed_dim // 2, kernel_size=(3, 3, 3), stride=(1, 2, 2), padding=(1, 1, 1)),
+            nn.BatchNorm3d(embed_dim // 2),
+            nn.GELU(),
+            nn.Conv3d(embed_dim // 2, embed_dim, kernel_size=(3, 3, 3), stride=(2, 2, 2), padding=(1, 1, 1)),
+            nn.BatchNorm3d(embed_dim),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: [B, C, T, H, W]
-        return x + self.dwconv(x)
-
-class LocalMHRA(nn.Module):
-    """Multi-Head Relation Aggregator for superficial stages (Local Convolutions)."""
-    def __init__(self, dim: int, kernel_size: tuple = (3, 3, 3)):
+        return self.proj(x)
+    
+class PatchEmbed(nn.Module):
+    def __init__(self, img_size=224, patch_size=16, in_chans=3, embed_dim=768):
         super().__init__()
-        padding = (kernel_size[0] // 2, kernel_size[1] // 2, kernel_size[2] // 2)
-        self.conv = nn.Conv3d(dim, dim, kernel_size=kernel_size, stride=1, padding=padding, groups=dim)
-        self.proj = nn.Linear(dim, dim)
+        img_size = to_2tuple(img_size)
+        patch_size = to_2tuple(patch_size)
+        self.img_size = img_size
+        self.patch_size = patch_size
+        self.norm = nn.LayerNorm(embed_dim)
+        self.proj = conv_1xnxn(in_chans, embed_dim, kernel_size=patch_size[0], stride=patch_size[0])
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: [B, C, T, H, W]
-        out = self.conv(x)
-        B, C, T, H, W = out.shape
-        out = out.permute(0, 2, 3, 4, 1)  # [B, T, H, W, C]
-        out = self.proj(out)
-        return out.permute(0, 4, 1, 2, 3)  # [B, C, T, H, W]
-
-
-class GlobalMHRA(nn.Module):
-    """Multi-Head Relation Aggregator for deep stages (3D Self-Attention)."""
-    def __init__(self, dim: int, num_heads: int = 8, qkv_bias: bool = True):
-        super().__init__()
-        self.num_heads = num_heads
-        self.head_dim = dim // num_heads
-        self.scale = self.head_dim ** -0.5
-
-        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
-        self.proj = nn.Linear(dim, dim)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x):
+        x = self.proj(x)
         B, C, T, H, W = x.shape
-        N = T * H * W # total number of token temporal-space
-
-        x_flat = x.permute(0, 2, 3, 4, 1).reshape(B, N, C)
-        qkv = self.qkv(x_flat).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
-        q, k, v = qkv[0], qkv[1], qkv[2]  # [B, num_heads, N, head_dim]
-
-        # Use FlashAttention / Memory Efficient Attention
-        out = F.scaled_dot_product_attention(q, k, v)
-        
-        out = out.transpose(1, 2).reshape(B, N, C)
-        out = self.proj(out)
-        return out.reshape(B, T, H, W, C).permute(0, 4, 1, 2, 3)
-
-
-class FFN(nn.Module):
-    """Feed Forward Network."""
-    def __init__(self, in_features: int, hidden_features: Optional[int] = None):
-        super().__init__()
-        hidden_features = hidden_features or in_features * 4
-        self.fc1 = nn.Linear(in_features, hidden_features)
-        self.act = nn.GELU()
-        self.fc2 = nn.Linear(hidden_features, in_features)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x_flat = x.permute(0, 2, 3, 4, 1)
-        x_flat = self.fc1(x_flat)
-        x_flat = self.act(x_flat)
-        x_flat = self.fc2(x_flat)
-        return x_flat.permute(0, 4, 1, 2, 3)
-
-
-class UniFormerBlock(nn.Module):
-    """Unified UniFormer block (Dynamic Position Embedding + Multi-Head Relation Aggregator + Feed Forward Network)."""
-    def __init__(self, dim: int, num_heads: int, is_global: bool = False):
-        super().__init__()
-        self.dpe = DynamicPositionEmbedding(dim)
-        self.norm1 = nn.BatchNorm3d(dim)
-        self.mhra = GlobalMHRA(dim, num_heads=num_heads) if is_global else LocalMHRA(dim)
-        self.norm2 = nn.BatchNorm3d(dim)
-        self.ffn = FFN(dim)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.dpe(x)
-        x = x + self.mhra(self.norm1(x))
-        x = x + self.ffn(self.norm2(x))
+        x = x.flatten(2).transpose(1, 2)
+        x = self.norm(x)
+        x = x.reshape(B, T, H, W, -1).permute(0, 4, 1, 2, 3).contiguous()
         return x
 
 
-class PatchEmbed3D(nn.Module):
-    """Patch Embedding / Downsampling between the stages of the network."""
-    def __init__(self, in_channels: int, out_channels: int, kernel_size=(1, 4, 4), stride=(1, 4, 4)):
-        super().__init__()
-        padding = (kernel_size[0] // 2, 0, 0) if kernel_size[0] % 2 != 0 else (0, 0, 0)
-        self.proj = nn.Conv3d(
-            in_channels, out_channels, kernel_size=kernel_size, stride=stride, padding=padding
-        )
-        self.norm = nn.BatchNorm3d(out_channels)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.proj(x)
-        return self.norm(x)
-
-
+# --- WRAPPER BACKBONE ---
 @BackboneFactory.register(BackboneType.UNIFORMER_XXS)
 class UniFormerXXSBackbone(BaseBackbone):
-    """
-    Adapted version of the backbone UniFormer-XXS.
-
-    Refs:
-        - Paper: "UniFormer: Unified Transformer for Efficient Spatiotemporal 
-          Representation Learning" (Li et al., ICLR 2022)
-          URL: https://arxiv.org/abs/2201.04676
-        - Official Repo: https://github.com/Sense-X/UniFormer
-
-    Args:
-        pretrained (bool): if True, loads pre-trained weights (e.g., on Kinetics-400). Default: True.
-        weights_path (str): Path to the weights file (.pth). 
-            Default: UNIFORMER_XXS_160_K400.
-        freeze_net (bool): If True, freezes all parameters of the backbone and 
-            sets it to `eval` mode. Default: True.
-        in_channels (int): Number of input channels (e.g., 3 for RGB video). Default: 3.
+    """ 
+    UniFormer-XXS Backbone natively adapted from Sense-X official implementation.
+    Adapted from:
+        https://github.com/Sense-X/UniFormer/blob/main/video_classification/slowfast/models/uniformer_light.py
     """
     def __init__(
-        self,
+        self, 
         pretrained: bool = True,
-        weights_path: str = UNIFORMER_XXS_160_K400,
+        weights_path: str = "weights/uniformer_xxs16_160_k400.pth",
         freeze_net: bool = True,
         in_channels: int = 3,
+        img_size: int = 224,
+        depths: list = [2, 5, 8, 2], 
+        embed_dims: list = [56, 112, 224, 448]
     ):
-        super().__init__(out_dim=512, pretrained=pretrained, freeze_net=freeze_net)
+        super().__init__(out_dim=embed_dims[-1], pretrained=pretrained, freeze_net=freeze_net)
 
-        depths = [3, 4, 8, 3]
-        embed_dims = [64, 128, 320, 512]
-        num_heads = [1, 2, 5, 8]
+        mlp_ratio = 3.
+        qkv_bias = True
+        qk_scale = None
+        drop_rate = 0.
+        attn_drop_rate = 0.
+        drop_path_rate = 0.
 
-        self.patch_embed1 = PatchEmbed3D(in_channels, embed_dims[0], kernel_size=(1, 4, 4), stride=(1, 4, 4))
-        self.stage1 = nn.ModuleList([
-            UniFormerBlock(embed_dims[0], num_heads[0], is_global=False) for _ in range(depths[0])
-        ])
+        norm_layer = partial(nn.LayerNorm, eps=1e-6) 
+        
+        self.patch_embed1 = SpeicalPatchEmbed(
+            in_chans=in_channels, embed_dim=embed_dims[0])
+        self.patch_embed2 = PatchEmbed(
+            img_size=img_size // 4, patch_size=2, in_chans=embed_dims[0], embed_dim=embed_dims[1])
+        self.patch_embed3 = PatchEmbed(
+            img_size=img_size // 8, patch_size=2, in_chans=embed_dims[1], embed_dim=embed_dims[2])
+        self.patch_embed4 = PatchEmbed(
+            img_size=img_size // 16, patch_size=2, in_chans=embed_dims[2], embed_dim=embed_dims[3])
 
-        self.patch_embed2 = PatchEmbed3D(embed_dims[0], embed_dims[1], kernel_size=(1, 2, 2), stride=(1, 2, 2))
-        self.stage2 = nn.ModuleList([
-            UniFormerBlock(embed_dims[1], num_heads[1], is_global=False) for _ in range(depths[1])
-        ])
+        self.pos_drop = nn.Dropout(p=drop_rate)
+        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, sum(depths))] 
+        
+        num_heads = [1, 2, 4, 8]
+        
+        self.blocks1 = nn.ModuleList([
+            CBlock(
+                dim=embed_dims[0], num_heads=num_heads[0], mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, qk_scale=qk_scale,
+                drop=drop_rate, attn_drop=attn_drop_rate, drop_path=dpr[i], norm_layer=norm_layer)
+            for i in range(depths[0])])
+            
+        self.blocks2 = nn.ModuleList([
+            CBlock(
+                dim=embed_dims[1], num_heads=num_heads[1], mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, qk_scale=qk_scale,
+                drop=drop_rate, attn_drop=attn_drop_rate, drop_path=dpr[i+depths[0]], norm_layer=norm_layer)
+            for i in range(depths[1])])
+            
+        self.blocks3 = nn.ModuleList([
+            SABlock(
+                dim=embed_dims[2], num_heads=num_heads[2], mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, qk_scale=qk_scale,
+                drop=drop_rate, attn_drop=attn_drop_rate, drop_path=dpr[i+depths[0]+depths[1]], norm_layer=norm_layer)
+            for i in range(depths[2])])
+            
+        self.blocks4 = nn.ModuleList([
+            SABlock(
+                dim=embed_dims[3], num_heads=num_heads[3], mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, qk_scale=qk_scale,
+                drop=drop_rate, attn_drop=attn_drop_rate, drop_path=dpr[i+depths[0]+depths[1]+depths[2]], norm_layer=norm_layer)
+        for i in range(depths[3])])
+        
+        self.norm = bn_3d(embed_dims[-1])
+        
+        self.apply(self._init_weights)
 
-        self.patch_embed3 = PatchEmbed3D(embed_dims[1], embed_dims[2], kernel_size=(1, 2, 2), stride=(1, 2, 2))
-        self.stage3 = nn.ModuleList([
-            UniFormerBlock(embed_dims[2], num_heads[2], is_global=True) for _ in range(depths[2])
-        ])
-
-        self.patch_embed4 = PatchEmbed3D(embed_dims[2], embed_dims[3], kernel_size=(1, 2, 2), stride=(1, 2, 2))
-        self.stage4 = nn.ModuleList([
-            UniFormerBlock(embed_dims[3], num_heads[3], is_global=True) for _ in range(depths[3])
-        ])
-
-        self.norm = nn.BatchNorm3d(embed_dims[3])
+        for name, p in self.named_parameters():
+            if 't_attn.qkv.weight' in name or 't_attn.qkv.bias' in name or 't_attn.proj.bias' in name:
+                nn.init.constant_(p, 0)
+            if 't_attn.proj.weight' in name:
+                nn.init.constant_(p, 1)
 
         if pretrained:
-            self._load_k400_weights(weights_path)
+            self._load_pretrained_weights(weights_path)
 
         if freeze_net:
             self.freeze()
 
-    def _load_k400_weights(self, weights_path: str):
+    def _init_weights(self, m):
+        if isinstance(m, nn.Linear):
+            trunc_normal_(m.weight, std=.02)
+            if isinstance(m, nn.Linear) and m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+        elif isinstance(m, nn.LayerNorm):
+            nn.init.constant_(m.bias, 0)
+            nn.init.constant_(m.weight, 1.0)
+
+    def _load_pretrained_weights(self, weights_path: str):
         """
-        Weight adaptation from Kinetics-400 pre-trained model to the current UniFormer-XXS architecture.
-        This function ignores the classification head and only loads the backbone weights.
+        Weight adaptation for UniFormer-XXS pre-trained on Kinetics-400.
+        Loads the weights from a local checkpoint file and removes the classification head parameters.
         """
         if not os.path.exists(weights_path):
-            print(f"[WARNING] Weights file not found at '{weights_path}'. Randomly initializing parameters.")
+            print(f"[WARNING] Local weights file not found at '{weights_path}'")
             return
-
-        print(f"[INFO] Loading pre-trained Kinetics-400 weights from: {weights_path}")
-        checkpoint = torch.load(weights_path, map_location="cpu")
-        raw_state_dict = checkpoint.get("model", checkpoint.get("state_dict", checkpoint))
-
-        mapped_state_dict = {}
-        for key, value in raw_state_dict.items():
-            new_key = key.replace("backbone.", "").replace("module.", "")
-
-            # Ignore the classification head and projection layers
-            if new_key.startswith("head.") or new_key.startswith("fc.") or new_key.startswith("projection."):
-                continue
-
-            for i in range(1, 5):
-                new_key = new_key.replace(f"blocks{i}.", f"stage{i}.")
-                new_key = new_key.replace(f"blocks.{i-1}.", f"stage{i}.")
-
-            # Submodule mapping
-            new_key = new_key.replace("mlp.", "ffn.")
-            new_key = new_key.replace("attn.", "mhra.")
-            new_key = new_key.replace("pos_embed.", "dpe.")
-
-            mapped_state_dict[new_key] = value
-
-        # Loading with strict=False to ignore the classification head of the source dataset
-        missing, unexpected = self.load_state_dict(mapped_state_dict, strict=False)
-        print(f"[SUCCESS] Kinetics-400 weights loaded successfully!")
-        print(f"  - Missing keys (typically just Head/FC): {len(missing)}")
-        print(f"  - Unexpected keys: {len(unexpected)}")
             
-    
+        checkpoint = torch.load(weights_path, map_location='cpu')
+        state_dict = checkpoint.get("model", checkpoint.get("model_state", checkpoint))
+        
+        keys_to_delete = [
+            k for k in state_dict.keys() 
+            if k.startswith("head.") or k.startswith("pre_logits.") or k.startswith("cls_") or "cls" in k
+        ]
+        for k in keys_to_delete:
+            del state_dict[k]
+            
+        missing, unexpected = self.load_state_dict(state_dict, strict=False)
+        print(f"[SUCCESS] Weights loaded successfully from {weights_path}")
+        print(f"  - Missing keys: {len(missing)} (dovrebbe essere 0)")
+        print(f"  - Unexpected keys: {len(unexpected)} (dovrebbe essere 0)")
+
+        if len(missing) > 0:
+            print("\n--- ESEMPIO MISSING KEYS ---")
+            for k in missing:
+                print(k)
+                
+        if len(unexpected) > 0:
+            print("\n--- ESEMPIO UNEXPECTED KEYS ---")
+            for k in unexpected:
+                print(k)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Input:  [B, T, C, H, W]
-        Output: [B, T, D] 
-        """
-        # Conversion from [B, T, C, H, W] to [B, C, T, H, W] for 3D Conv
         if x.dim() == 5 and x.shape[1] != 3 and x.shape[2] == 3:
             x = x.permute(0, 2, 1, 3, 4).contiguous()
 
-        # Passing through the backbone stages
         x = self.patch_embed1(x)
-        for blk in self.stage1:
-            x = blk(x)
-
+        x = self.pos_drop(x)
+        
+        for blk in self.blocks1: x = blk(x)
         x = self.patch_embed2(x)
-        for blk in self.stage2:
-            x = blk(x)
-
+        
+        for blk in self.blocks2: x = blk(x)
         x = self.patch_embed3(x)
-        for blk in self.stage3:
-            x = blk(x)
-
+        
+        for blk in self.blocks3: x = blk(x)
         x = self.patch_embed4(x)
-        for blk in self.stage4:
-            x = blk(x)
-
-        x = self.norm(x)  # Shape: [B, D, T, H', W'] 
-
-        # Global Average Pooling on dimensions H and W
-        x = torch.mean(x, dim=(-2, -1))  # Shape: [B, D, T]
-
-        # Permutation for the sequential representation [B, T, D]
+        
+        for blk in self.blocks4: x = blk(x)
+        
+        x = self.norm(x) # [B, D, T, H', W']
+        
+        x = torch.mean(x, dim=(-2, -1)) # [B, D, T]
+        
         x = x.permute(0, 2, 1).contiguous()
         return x
