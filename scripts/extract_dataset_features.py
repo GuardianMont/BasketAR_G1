@@ -367,7 +367,14 @@ def main():
     parser.add_argument("--num-frames", type=int, default=16)
     parser.add_argument(
         "--temporal-sampler",
-        choices=["legacy_uniform", "uniform", "fixed_fps", "first_last", "edge_dense"],
+        choices=[
+            "legacy_uniform",
+            "uniform",
+            "preserve_all",
+            "fixed_fps",
+            "first_last",
+            "edge_dense",
+        ],
         default="legacy_uniform",
     )
     parser.add_argument("--target-fps", type=float, default=15.0)
