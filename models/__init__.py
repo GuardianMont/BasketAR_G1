@@ -1,5 +1,5 @@
 from .base import BaseBackbone, BaseTemporalNeck, BaseClassifierHead
-from .backbone import X3DSBackbone, ConvNeXt2DBackbone, BallTrackerBackbone, CompositeBackbone, X3DLBackbone
+from .backbone import X3DSBackbone, ConvNeXt2DBackbone, BallTrackerBackbone, CompositeBackbone, X3DLBackbone, BackboneFactory, BackboneType
 from .necks import IdentityNeck, TCNNeck, BiGRUNeck
 from .heads import MeanPoolingClassifierHead, AttentionClassifierHead
 from .pipeline import ARPipeline
@@ -19,5 +19,7 @@ __all__ = [
     "MeanPoolingClassifierHead",
     "AttentionClassifierHead",
     "ARPipeline",
-    "Trainer"
+    "Trainer",
+    "BackboneFactory",
+    "BackboneType"
 ]
