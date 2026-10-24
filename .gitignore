@@ -5,3 +5,5 @@ dataset/*
 features/*
 dataset_hd/*
 *.zip
+annotation/*
+*.pt
