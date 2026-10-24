@@ -5,6 +5,7 @@ from typing import Optional, List
 import torch
 import torch.nn as nn
 from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
+import math
 
 from .base import BaseTemporalNeck
 
@@ -167,3 +168,107 @@ class TCNNeck(BaseTemporalNeck):
 
         # Back to original shape (B, T, D_neck) for Classifier Head
         return x_t.transpose(1, 2)
+
+
+class TemporalTransformerNeck(BaseTemporalNeck):
+    """Temporal Transformer Neck for modeling long-range dependencies.
+
+    Tensor Shapes:
+        - Input `x`: Feature sequence of shape (B, T, D)
+        - Input `lengths`: Optional 1D tensor of shape (B,) containing the number of valid frames for each sequence
+        - Output: Contextualized sequence of shape (B, T, embed_dim)
+
+    Args:
+        in_dim (int): Dimension of the input vectors from the backbone (D).
+        embed_dim (int, optional): Dimension of the Transformer's latent space. If None, uses in_dim.
+        num_heads (int, optional): Number of attention heads (default: 8).
+        num_layers (int, optional): Number of stacked TransformerEncoder layers (default: 2).
+        dim_feedforward (int, optional): Dimension of the internal MLP (default: 2048).
+        dropout (float, optional): Dropout probability (default: 0.1).
+        max_len (int, optional): Maximum video sequence length (default: 500).
+    """
+
+    def __init__(
+        self,
+        in_dim: int,
+        embed_dim: Optional[int] = None,
+        num_heads: int = 8,
+        num_layers: int = 2,
+        dim_feedforward: int = 2048,
+        dropout: float = 0.1,
+        max_len: int = 500,
+    ):
+        super().__init__(in_dim=in_dim, out_dim=out_dim)
+        out_dim = embed_dim if embed_dim is not None else in_dim
+
+        self.proj = (
+            nn.Linear(in_dim, out_dim) if in_dim != out_dim else nn.Identity()
+        )
+
+        # Positional Encoding
+        self.pos_encoder = PositionalEncoding(out_dim, max_len=max_len)
+        self.dropout = nn.Dropout(p=dropout)
+
+        # PyTorch Transformer encoder layer with batch-first input format.
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=out_dim,
+            nhead=num_heads,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout,
+            batch_first=True,
+            activation="gelu",
+        )
+        self.transformer_encoder = nn.TransformerEncoder(
+            encoder_layer, num_layers=num_layers
+        )
+
+        self.norm = nn.LayerNorm(out_dim)
+
+    def forward(
+        self, x: torch.Tensor, lengths: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+
+        x = self.proj(x)
+        x = self.pos_encoder(x)
+        x = self.dropout(x)
+
+        # Build the padding mask for variable-length sequences.
+        key_padding_mask = None
+        if lengths is not None:
+            max_len = x.size(1)
+            lengths_device = lengths.to(x.device)
+            key_padding_mask = (
+                torch.arange(max_len, device=x.device)[None, :]
+                >= lengths_device[:, None]
+            )
+
+        out = self.transformer_encoder(
+            x, src_key_padding_mask=key_padding_mask
+        )
+        out = self.norm(out)
+
+        # Zero out padded frame representations to prevent downstream noise.
+        if key_padding_mask is not None:
+            out = out.masked_fill(key_padding_mask.unsqueeze(-1), 0.0)
+
+        return out
+
+    
+class PositionalEncoding(nn.Module):
+    """Adds temporal position information to frame representations."""
+
+    def __init__(self, d_model: int, max_len: int = 500):
+        super().__init__()
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(
+            torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model)
+        )
+
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        self.register_buffer("pe", pe.unsqueeze(0))  # Shape: (1, max_len, d_model)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x shape: (B, T, D)
+        return x + self.pe[:, : x.size(1), :]

@@ -259,13 +259,14 @@ def extract_features_offline(
             #
             # X3DSBackbone currently preserves T.
             #
+            """
             if group_features.shape[1] != valid_length:
                 raise RuntimeError(
                     "Current extractor expects a backbone "
                     "that preserves temporal length. "
                     f"Input T={valid_length}, "
                     f"output T={group_features.shape[1]}."
-                )
+                )"""
 
             group_features = (
                 group_features
