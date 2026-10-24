@@ -1,12 +1,18 @@
 """
 Implementations of Temporal Neck modules for sequence modeling.
 """
-from typing import Optional, List
+from typing import Any, Dict, Optional, List, Tuple
 import torch
 import torch.nn as nn
 from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
+from .base import BaseTemporalNeck, BaseTypeEnum
 
-from .base import BaseTemporalNeck
+
+class NeckType(BaseTypeEnum):
+    """Enumeration of supported Temporal Neck types."""
+    IDENTITY = "Identity"
+    BIGRU = "BiGRU"
+    TCN = "TCNNeck"
 
 
 class IdentityNeck(BaseTemporalNeck):
@@ -42,7 +48,13 @@ class BiGRUNeck(BaseTemporalNeck):
         dropout (float, optional): Dropout probability applied between stacked GRU 
             layers (active only when `num_layers > 1`). Default: 0
     """
-    def __init__(self, in_dim: int, hidden_dim: int, num_layers: int = 2, dropout: float = 0):
+    def __init__(
+        self, 
+        in_dim: int, 
+        hidden_dim: int, 
+        num_layers: int = 2, 
+        dropout: float = 0.0
+    ):
         out_dim = hidden_dim * 2
         super().__init__(in_dim=in_dim, out_dim=out_dim)
 
@@ -54,6 +66,9 @@ class BiGRUNeck(BaseTemporalNeck):
             bidirectional=True,
             dropout=dropout if num_layers > 1 else 0.0
         )
+        
+        # Explicit dropout after final layer
+        self.dropout = nn.Dropout(p=dropout) if dropout > 0.0 else nn.Identity()
 
     def forward(self, x: torch.Tensor, lengths: Optional[torch.Tensor] = None) -> torch.Tensor:
         if lengths is not None:
@@ -63,6 +78,8 @@ class BiGRUNeck(BaseTemporalNeck):
             out, _ = pad_packed_sequence(out_packed, batch_first=True)
         else:
             out, _ = self.gru(x)
+            
+        out = self.dropout(out)
 
         return out
 
@@ -167,3 +184,35 @@ class TCNNeck(BaseTemporalNeck):
 
         # Back to original shape (B, T, D_neck) for Classifier Head
         return x_t.transpose(1, 2)
+
+
+class NeckFactory:
+    """Factory class to create Temporal Neck modules based on configuration."""
+   
+    @staticmethod
+    def create(neck_type: str | NeckType, kwargs: Dict[str, Any], in_dim: int) -> Tuple[nn.Module, int]:
+        neck_type = NeckType.from_str(neck_type)
+        if neck_type == NeckType.BIGRU:
+            hidden_dim = kwargs["hidden_dim"]
+            out_dim = hidden_dim * 2 # Bidirectional
+            neck = BiGRUNeck(
+                in_dim=in_dim,
+                hidden_dim=hidden_dim,
+                num_layers=kwargs["num_layers"],
+                dropout=kwargs.get('dropout', 0.0)
+            )
+            
+        elif neck_type == NeckType.TCN:
+            num_channels = kwargs["num_channels"]
+            neck = TCNNeck(
+                in_dim=in_dim,
+                num_channels=num_channels,
+                kernel_size=kwargs["kernel_size"],
+                dropout=kwargs.get('dropout', 0.0)
+            )
+        elif neck_type == NeckType.IDENTITY:
+            neck = IdentityNeck(in_dim=in_dim)
+        else:
+            raise ValueError(f"Unsupported: {neck_type}")
+            
+        return neck, neck.out_dim

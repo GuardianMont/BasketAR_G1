@@ -24,6 +24,39 @@ CLASS_NAMES = [
     "non-gioco",
 ]
 
+CLASS_NAMES_NOACTION = [
+    "passaggio",
+    "tiroDaDue0",
+    "tiroDaDue1",
+    "tiroDaTre0",
+    "tiroDaTre1",
+    "tiroLibero0",
+    "tiroLibero1",
+    "no_action"
+]
+
+CLASS_NAMES_P2 = [
+    "passaggio",
+    "tiroDaDue",
+    "tiroDaTre",
+    "tiroLibero",
+    "no_action"
+]
+
+def map_to_p2_labels(labels: list[int]) -> list[int]:
+    p2_labels = []
+    for lbl in labels:
+        if lbl == 0:
+            p2_labels.append(0)  # passaggio
+        elif lbl in (1, 2):
+            p2_labels.append(1)  # tiroDaDue
+        elif lbl in (3, 4):
+            p2_labels.append(2)  # tiroDaTre
+        elif lbl in (5, 6):
+            p2_labels.append(3)  # tiroLibero
+        else:
+            p2_labels.append(4)  # no_action
+    return p2_labels
 
 def generate_confusion_matrix_figure(y_true, y_pred, class_names=CLASS_NAMES):
     """Generates a normalized confusion matrix plot using Seaborn."""
