@@ -64,9 +64,7 @@ def _resolve_device(
     if device is not None:
         return torch.device(device)
 
-    return torch.device(
-        "cuda" if torch.cuda.is_available() else "cpu"
-    )
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 @torch.inference_mode()
@@ -190,34 +188,14 @@ def extract_features_offline(
         # Samples having the same valid length are grouped together
         # and truncated before entering the backbone.
         #
-        for valid_length in torch.unique(
-            lengths,
-            sorted=True,
-        ).tolist():
-
-            sample_indices = torch.nonzero(
-                lengths == valid_length,
-                as_tuple=False,
-            ).flatten()
-
+        for valid_length in torch.unique(lengths, sorted=True).tolist():
+            sample_indices = torch.nonzero(lengths == valid_length, as_tuple=False).flatten()
             if is_dual:
-                clip_group_norm = batch["x_norm"][
-                    sample_indices,
-                    :,
-                    :valid_length,
-                    :,
-                    :,
-                ].to(
+                clip_group_norm = batch["x_norm"][sample_indices,:,:valid_length,:,:].to(
                     device,
                     non_blocking=True,
                 )
-                clip_group_raw = batch["x_raw"][
-                    sample_indices,
-                    :,
-                    :valid_length,
-                    :,
-                    :,
-                ].to(
+                clip_group_raw = batch["x_raw"][sample_indices,:,:valid_length,:,:].to(
                     device,
                     non_blocking=True,
                 )
@@ -226,13 +204,7 @@ def extract_features_offline(
                 else:
                     raise RuntimeError("Dual inputs provided but backbone lacks forward_dual()")
             else:
-                clip_group = videos[
-                    sample_indices,
-                    :,
-                    :valid_length,
-                    :,
-                    :,
-                ].to(
+                clip_group = videos[sample_indices,:,:valid_length,:,:].to(
                     device,
                     non_blocking=True,
                 )
@@ -243,18 +215,12 @@ def extract_features_offline(
 
             if group_features.dim() != 3:
                 raise RuntimeError(
-                    "Backbone must return features "
-                    "with shape (B, T, D), got "
+                    "Backbone must return features with shape (B, T, D), got "
                     f"{tuple(group_features.shape)}."
                 )
 
-            if group_features.shape[0] != len(
-                sample_indices
-            ):
-                raise RuntimeError(
-                    "Backbone unexpectedly changed "
-                    "the batch dimension."
-                )
+            if group_features.shape[0] != len(sample_indices):
+                raise RuntimeError("Backbone unexpectedly changed the batch dimension.")
 
             #
             # X3DSBackbone currently preserves T.
@@ -268,83 +234,42 @@ def extract_features_offline(
                     f"output T={group_features.shape[1]}."
                 )"""
 
-            group_features = (
-                group_features
-                .detach()
-                .cpu()
-            )
+            group_features = (group_features.detach().cpu())
 
-            for group_position, original_index in enumerate(
-                sample_indices.tolist()
-            ):
-
-                features_by_sample[
-                    original_index
-                ] = (
-                    group_features[
-                        group_position
-                    ]
-                    .contiguous()
-                )
+            for group_position, original_index in enumerate(sample_indices.tolist()):
+                features_by_sample[original_index] = (group_features[group_position].contiguous())
 
         #
         # Restore original DataLoader sample order.
         #
-        for sample_index, features in enumerate(
-            features_by_sample
-        ):
-
+        for sample_index, features in enumerate(features_by_sample):
             if features is None:
-                raise RuntimeError(
-                    "Feature extraction failed "
-                    "for one or more samples."
-                )
+                raise RuntimeError("Feature extraction failed for one or more samples.")
 
             extracted_samples.append(
                 {
-                    "id": sample_ids[
-                        sample_index
-                    ],
+                    "id": sample_ids[sample_index],
                     "data": features,
-                    "label": int(
-                        labels[
-                            sample_index
-                        ]
-                    ),
-                    "num_frames": int(
-                        features.shape[0]
-                    ),
+                    "label": int(labels[sample_index]),
+                    "num_frames": int(features.shape[0]),
                 }
             )
 
         try:
             total_batches = len(dataloader)
-            progress = (
-                f"{batch_index + 1}/"
-                f"{total_batches}"
-            )
+            progress = (f"{batch_index + 1}/{total_batches}")
 
         except TypeError:
-            progress = str(
-                batch_index + 1
-            )
+            progress = str(batch_index + 1)
 
-        print(
-            f"\rExtracted batch {progress}",
-            end="",
-            flush=True,
-        )
+        print(f"\rExtracted batch {progress}", end="", flush=True)
 
     print()
 
     feature_dim = None
 
     if extracted_samples:
-        feature_dim = int(
-            extracted_samples[
-                0
-            ]["data"].shape[1]
-        )
+        feature_dim = int(extracted_samples[0]["data"].shape[1])
 
     payload = {
         "format_version": 1,
@@ -365,13 +290,8 @@ def extract_features_offline(
         output_path.suffix + ".tmp"
     )
 
-    torch.save(
-        payload,
-        temporary_path,
-    )
+    torch.save(payload, temporary_path)
 
-    temporary_path.replace(
-        output_path
-    )
+    temporary_path.replace(output_path)
 
     return payload
