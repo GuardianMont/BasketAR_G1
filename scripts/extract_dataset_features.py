@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 from inspect import Parameter, signature
 from pathlib import Path
+from typing import Optional
 
 import av
 import pandas as pd
@@ -10,10 +11,10 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
 
-from data import RandomTemporalShift, VideoHorizontalFlip
 from data.experiment_config import ExperimentConfig
 from data.spatial import preprocess_frame
 from data.utils import pad_and_collate_video_batch
+from data.transforms import ClassAwareVideoTransform
 from data.temporal_sampling import (
     LegacyUniformSampler,
     SAMPLER_REGISTRY,
@@ -23,9 +24,7 @@ from data.temporal_sampling import (
 from models import (
     BallTrackerBackbone,
     CompositeBackbone,
-    ConvNeXt2DBackbone,
     X3DLBackbone,
-    X3DSBackbone,
 )
 from models.backbone import BackboneType, BackboneFactory
 from scripts.extract_features import extract_features_offline
@@ -42,6 +41,12 @@ LABEL_TO_ID = {
     "non-gioco": 8,
 }
 
+X3D_MEAN = (0.45, 0.45, 0.45)
+X3D_STD = (0.225, 0.225, 0.225)
+
+IMAGE_NET_MEAN = (0.485, 0.456, 0.406)
+IMAGE_NET_STD = (0.229, 0.224, 0.225)
+
 
 def validate_tracker_preprocessing(
     spatial_mode: str, color: str, feature_stream: str
@@ -56,11 +61,6 @@ def validate_tracker_preprocessing(
             "su spatial_mode/colore usa --feature-stream 3d."
         )
 
-X3D_MEAN = (0.45, 0.45, 0.45)
-X3D_STD = (0.225, 0.225, 0.225)
-
-IMAGE_NET_MEAN = (0.485, 0.456, 0.406)
-IMAGE_NET_STD = (0.229, 0.224, 0.225)
 
 class ManifestVideoDataset(Dataset):
 
@@ -71,22 +71,26 @@ class ManifestVideoDataset(Dataset):
         num_frames=16,
         target_size=312,
         limit=None,
-        transform=None,
+        transform: Optional[ClassAwareVideoTransform] = None,
         temporal_sampler: TemporalSampler | None = None,
         spatial_mode="letterbox",
         color_mode="rgb",
-        normalization_vector = (X3D_MEAN, X3D_STD)
+        normalization_vector=(X3D_MEAN, X3D_STD),
+        oversample_factor=1
     ):
         self.root = Path(root)
         self.transform = transform
         self.num_frames = num_frames
         self.target_size = target_size
         self.temporal_sampler = temporal_sampler or LegacyUniformSampler(num_frames)
+        
         sampler_name = self.temporal_sampler.config().get("name")
-        if isinstance(transform, RandomTemporalShift) and sampler_name in {
-            "first_last",
-            "edge_dense",
-        }:
+        has_temporal_shift = (
+            isinstance(transform, ClassAwareVideoTransform)
+            and transform.has_temporal_shift
+        )
+
+        if has_temporal_shift and sampler_name in {"first_last", "edge_dense"}:
             raise ValueError(
                 "RandomTemporalShift cannot be combined with the "
                 f"'{sampler_name}' sampler because it moves the selected endpoints."
@@ -105,11 +109,30 @@ class ManifestVideoDataset(Dataset):
         if unknown:
             raise ValueError(f"Unknown labels: {unknown}")
 
-        self.rows = df.to_dict("records")
+        raw_rows = df.to_dict("records")
+        self.rows = []
+
+        for row in raw_rows:
+            label_id = LABEL_TO_ID[row["label"]]
+            
+            if (
+                isinstance(transform, ClassAwareVideoTransform)
+                and transform.should_apply(label_id)
+                and oversample_factor > 1
+            ):
+                for aug_idx in range(oversample_factor):
+                    augmented_row = row.copy()
+                    # Unique id, avoids collisions
+                    augmented_row["clip_id"] = f"{row['clip_id']}_aug{aug_idx}"
+                    self.rows.append(augmented_row)
+            else:
+                self.rows.append(row)
+        
         if spatial_mode not in {"letterbox", "stretch"}:
             raise ValueError(f"Unsupported spatial mode: {spatial_mode}")
         if color_mode not in {"rgb", "grayscale"}:
             raise ValueError(f"Unsupported color mode: {color_mode}")
+
         self.spatial_mode = spatial_mode
         self.color_mode = color_mode
         self.normalization_vector = normalization_vector
@@ -124,10 +147,10 @@ class ManifestVideoDataset(Dataset):
             spatial_size=self.target_size,
             color_mode=self.color_mode,
             mean_norm_vector=self.normalization_vector[0],
-            std_norm_vector= self.normalization_vector[1]
+            std_norm_vector=self.normalization_vector[1],
         )
 
-    def _decode_clip(self, path):
+    def _decode_clip(self, path, label_id: int):
         with av.open(str(path)) as container:
             stream = container.streams.video[0]
             total_frames = int(stream.frames or 0)
@@ -138,8 +161,14 @@ class ManifestVideoDataset(Dataset):
                 total_frames = sum(1 for _ in container.decode(video=0))
 
         indices = self.temporal_sampler.sample_indices(total_frames, fps=fps)
-        if isinstance(self.transform, RandomTemporalShift):
-            indices = self.transform(indices, total_frames)
+
+        if (
+            isinstance(self.transform, ClassAwareVideoTransform)
+            and self.transform.has_temporal_shift
+            and self.transform.should_apply(label_id)
+        ):
+            indices = self.transform.apply_temporal_shift(indices, total_frames)
+
         wanted = set(indices)
         decoded_norm = {}
         decoded_raw = {}
@@ -158,36 +187,36 @@ class ManifestVideoDataset(Dataset):
 
         missing = sorted(wanted - set(decoded_norm))
         if missing:
-            raise RuntimeError(
-                f"Could not decode frames {missing} from {path}"
-            )
+            raise RuntimeError(f"Could not decode frames {missing} from {path}")
 
         frames_norm = [decoded_norm[i] for i in indices]
         frames_raw = [decoded_raw[i] for i in indices]
-        clip_norm = torch.stack(frames_norm, dim=1)
-        clip_raw = torch.stack(frames_raw, dim=1)
+        clip_norm = torch.stack(frames_norm, dim=1)  # (C, T, H, W)
+        clip_raw = torch.stack(frames_raw, dim=1)    # (C, T, H, W)
 
         is_flipped = False
-        if isinstance(self.transform, VideoHorizontalFlip):
-            clip_norm = self.transform(clip_norm)
-            clip_raw = self.transform(clip_raw)
-            is_flipped = True
+
+        if isinstance(self.transform, ClassAwareVideoTransform):
+            clip_norm, clip_raw, is_flipped = self.transform.apply_spatial_transforms(
+                clip_norm, clip_raw, label_id
+            )
 
         return clip_norm, clip_raw, is_flipped
 
     def __getitem__(self, index):
         row = self.rows[index]
         path = self.root / row["path"]
+        label_id = LABEL_TO_ID[row["label"]]
 
         if not path.exists():
             raise FileNotFoundError(path)
 
-        clip_norm, clip_raw, is_flipped = self._decode_clip(path)
+        clip_norm, clip_raw, is_flipped = self._decode_clip(path, label_id)
 
         return {
             "x_norm": clip_norm,
             "x_raw": clip_raw,
-            "label": LABEL_TO_ID[row["label"]],
+            "label": label_id,
             "length": clip_norm.shape[1],
             "sample_id": row["clip_id"],
             "is_flipped": is_flipped,
@@ -197,13 +226,9 @@ class ManifestVideoDataset(Dataset):
 def build_backbone_and_filename(
     config_type: str,
     backbone_type: str = BackboneType.X3D_L.value,
-    dino_type = None,
+    dino_type: Optional[str] = None,
     tracker_model_path: str = "yolov8n.pt",
 ) -> tuple[nn.Module, str]:
-    """Costruisce la CompositeBackbone dagli import ufficiali di models e
-
-    definisce il nome del file.
-    """
     backbone_list = []
     filename_parts = ["3d"]
 
@@ -217,9 +242,7 @@ def build_backbone_and_filename(
     print(f"[DEBUG DIRECT] Created {backbone_type} with out_dim={backbone_list[-1].out_dim}")
 
     if "tracker" in config_type:
-        backbone_list.append(
-            BallTrackerBackbone(model_path=tracker_model_path)
-        )
+        backbone_list.append(BallTrackerBackbone(model_path=tracker_model_path))
         filename_parts.append("tracker")
 
     if isinstance(backbone, X3DLBackbone):
@@ -250,8 +273,8 @@ def extract_all_configurations(args):
         target_size = BackboneFactory().create(args.backbone_type).out_dim
     else:
         target_size = BackboneFactory().create(
-            args.backbone_type, model_name=args.dino_type).out_dim
-
+            args.backbone_type, model_name=args.dino_type
+        ).out_dim
 
     print(
         f"\n{'='*70}\n[RUNNER] Inizio estrazione per SPLIT:"
@@ -259,10 +282,14 @@ def extract_all_configurations(args):
         f" {target_size}\n{'='*70}"
     )
 
-    if args.transform == "horizontal_flip":
-        transform = VideoHorizontalFlip()
-    elif args.transform == "temporal_shift":
-        transform = RandomTemporalShift(shift_range=3)
+    transform_list = [t for t in args.transforms if t != "none"]
+    minority_set = set(args.minority_classes) if args.minority_classes else None
+
+    if transform_list:
+        transform = ClassAwareVideoTransform(
+            transform_names=transform_list,
+            minority_classes=minority_set,
+        )
     else:
         transform = None
 
@@ -272,6 +299,7 @@ def extract_all_configurations(args):
         raise ValueError(
             f"Unknown temporal sampler '{args.temporal_sampler}'. Available: {available}."
         )
+        
     sampler_parameters = signature(sampler_class.__init__).parameters
     sampler_config = {"name": args.temporal_sampler}
     sampler_config.update(
@@ -286,10 +314,10 @@ def extract_all_configurations(args):
     temporal_sampler = build_temporal_sampler(sampler_config)
 
     if args.backbone_type == BackboneType.DINO:
-        nv = (IMAGE_NET_MEAN, IMAGE_NET_STD) 
+        nv = (IMAGE_NET_MEAN, IMAGE_NET_STD)
     else:
         nv = (X3D_MEAN, X3D_STD)
-    
+
     dataset = ManifestVideoDataset(
         root=args.dataset_root,
         split=args.split,
@@ -300,7 +328,8 @@ def extract_all_configurations(args):
         temporal_sampler=temporal_sampler,
         spatial_mode=args.spatial_mode,
         color_mode=args.color,
-        normalization_vector=nv
+        normalization_vector=nv,
+        oversample_factor=args.oversample_factor
     )
 
     loader = DataLoader(
@@ -324,7 +353,7 @@ def extract_all_configurations(args):
         backbone, _ = build_backbone_and_filename(
             config_type=cfg,
             backbone_type=args.backbone_type,
-            dino_type = args.dino_type,
+            dino_type=args.dino_type,
             tracker_model_path=args.tracker_model_path,
         )
 
@@ -334,10 +363,11 @@ def extract_all_configurations(args):
             spatial_size=target_size,
             color=args.color,
             backbone=args.backbone_type.lower().replace("-", "_"),
-            dino_type = args.dino_type,
+            dino_type=args.dino_type,
             tracker="yolov8n_coco" if "tracker" in cfg else "none",
             extra={
-                "transform": args.transform,
+                "transforms": transform_list,
+                "minority_classes": list(minority_set) if minority_set else None,
                 **({"limit": args.limit} if args.limit is not None else {}),
             },
         )
@@ -379,7 +409,7 @@ def main():
     parser.add_argument(
         "--output-dir",
         default="features",
-        help="Directory di destinazione per salvataggio file .pt",
+        help="Where the .pt file should be saved",
     )
     parser.add_argument(
         "--backbone-type",
@@ -392,10 +422,35 @@ def main():
         default="yolov8n.pt",
     )
     parser.add_argument(
+        "--transforms",
         "--transform",
-        choices=["none", "horizontal_flip", "temporal_shift"],
-        default="none",
+        nargs="+",
+        choices=[
+            "none",
+            "horizontal_flip",
+            "temporal_shift",
+            "color_jitter",
+            "gaussian_blur",
+            "random_crop",
+        ],
+        default=["none"],
+        help="transform list to be applied",
     )
+    parser.add_argument(
+        "--minority-classes",
+        nargs="+",
+        type=int,
+        default=None,
+        help="Class'IDs where the transforms should be applied",
+    )
+
+    parser.add_argument(
+        "--oversample-factor",
+        type=int,
+        default=1,
+        help="Number of samples to be produced for every `minority class` clip",
+    )
+
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--num-frames", type=int, default=16)
@@ -422,7 +477,6 @@ def main():
         "--feature-stream",
         choices=["3d", "3d_tracker", "all"],
         default="all",
-        help="Fase 1 baseline usa '3d' (X3D-L senza tracker).",
     )
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--overwrite", action="store_true")
