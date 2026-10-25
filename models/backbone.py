@@ -14,6 +14,7 @@ from torchvision.models.video import swin3d_t, Swin3D_T_Weights
 
 from .base import BaseBackbone
 
+WEIGHTS_PATH = 'weights'
 
 class BackboneType(str, Enum):
     X3D_S = "X3D-S"
@@ -22,6 +23,7 @@ class BackboneType(str, Enum):
     ACA_NET = "ACA-NET"
     VIDEO_SWIN = "VIDEO-SWIN"
     UNIFORMER_XXS = "UNIFORMER-XXS"
+    DINO = "DINO"
 
     @classmethod
     def list_names(cls) -> List[str]:
@@ -1030,3 +1032,71 @@ class UniFormerXXSBackbone(BaseBackbone):
         
         x = x.permute(0, 2, 1).contiguous()
         return x
+
+# Just the one's tried. A full list is available in the official repository
+DINO_MODELS = {
+    "dinov3_vits16": 384,
+    "dinov3_vitb16": 768,
+    "dinov3_convnext_small": 768,
+}
+
+
+@BackboneFactory.register(BackboneType.DINO)
+class DINOv3Backbone(nn.Module):
+    """DINOv3 wrapper to be instantiated via PyTorch Hub."""
+
+    def __init__(
+        self,
+        repo_dir: str = "external_repo/dinov3",
+        model_name: str = "dinov3_vitb16",
+        pretrained: bool=True,
+        freeze_net: bool = True,
+    ):
+        super().__init__()
+
+        if not os.path.exists(repo_dir):
+            raise FileNotFoundError(f"DINOv3 not found in {repo_dir}")
+
+        weights_path = os.path.join(WEIGHTS_PATH, f"{model_name}.pth")
+        if not os.path.exists(weights_path):
+            raise FileNotFoundError(f"Weights not found in {weights_path}")
+
+        if model_name not in DINO_MODELS.keys():
+            raise ValueError(
+                f"Model '{model_name}' not recognized. Supported: {list(DINO_MODELS.keys())}"
+            )
+
+        self.dino = torch.hub.load(
+            repo_dir,
+            model_name,
+            source="local",
+            weights=weights_path,
+        )
+
+        if hasattr(self.dino, "embed_dim"):
+            self.out_dim = self.dino.embed_dim
+        elif hasattr(self.dino, "num_features"):
+            self.out_dim = self.dino.num_features
+        else:
+            self.out_dim = DINO_MODELS[model_name]
+
+        if freeze_net:
+            for param in self.parameters():
+                param.requires_grad = False
+            self.eval()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Input x shape: (B, C, T, H, W)
+        Output shape : (B, T, 768)
+        """
+        B, C, T, H, W = x.shape
+
+        # Adapts the standard (B, C, T, H, W) shape to Dino's (B*T, C, H, W)
+        x_reshaped = x.permute(0, 2, 1, 3, 4).reshape(B * T, C, H, W)
+
+        features = self.dino(x_reshaped)  # (B*T, 768)
+
+        # Reshapes for contract's agreement
+        features = features.reshape(B, T, self.out_dim)
+        return features

@@ -8,3 +8,4 @@ weights/*
 *.sh
 dataset_hd/*
 *.zip
+external_repo

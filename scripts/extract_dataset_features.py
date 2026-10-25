@@ -56,6 +56,11 @@ def validate_tracker_preprocessing(
             "su spatial_mode/colore usa --feature-stream 3d."
         )
 
+X3D_MEAN = (0.45, 0.45, 0.45)
+X3D_STD = (0.225, 0.225, 0.225)
+
+IMAGE_NET_MEAN = (0.485, 0.456, 0.406)
+IMAGE_NET_STD = (0.229, 0.224, 0.225)
 
 class ManifestVideoDataset(Dataset):
 
@@ -70,6 +75,7 @@ class ManifestVideoDataset(Dataset):
         temporal_sampler: TemporalSampler | None = None,
         spatial_mode="letterbox",
         color_mode="rgb",
+        normalization_vector = (X3D_MEAN, X3D_STD)
     ):
         self.root = Path(root)
         self.transform = transform
@@ -106,6 +112,7 @@ class ManifestVideoDataset(Dataset):
             raise ValueError(f"Unsupported color mode: {color_mode}")
         self.spatial_mode = spatial_mode
         self.color_mode = color_mode
+        self.normalization_vector = normalization_vector
 
     def __len__(self):
         return len(self.rows)
@@ -116,6 +123,8 @@ class ManifestVideoDataset(Dataset):
             spatial_mode=self.spatial_mode,
             spatial_size=self.target_size,
             color_mode=self.color_mode,
+            mean_norm_vector=self.normalization_vector[0],
+            std_norm_vector= self.normalization_vector[1]
         )
 
     def _decode_clip(self, path):
@@ -188,6 +197,7 @@ class ManifestVideoDataset(Dataset):
 def build_backbone_and_filename(
     config_type: str,
     backbone_type: str = BackboneType.X3D_L.value,
+    dino_type = None,
     tracker_model_path: str = "yolov8n.pt",
 ) -> tuple[nn.Module, str]:
     """Costruisce la CompositeBackbone dagli import ufficiali di models e
@@ -198,7 +208,11 @@ def build_backbone_and_filename(
     filename_parts = ["3d"]
 
     factory = BackboneFactory()
-    backbone = factory.create(backbone_type, pretrained=True, freeze_net=True)
+    if dino_type:
+        backbone = factory.create(backbone_type, model_name=dino_type)
+    else:
+        backbone = factory.create(backbone_type)
+
     backbone_list.append(backbone)
     print(f"[DEBUG DIRECT] Created {backbone_type} with out_dim={backbone_list[-1].out_dim}")
 
@@ -223,10 +237,21 @@ def extract_all_configurations(args):
     validate_tracker_preprocessing(
         args.spatial_mode, args.color, args.feature_stream
     )
+
+    if args.backbone_type != BackboneType.DINO and args.dino_type:
+        raise ValueError(
+            "Can't set `--dino_type` argument when `--backbone_type` is not DINO"
+        )
+
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    target_size = BackboneFactory().create(args.backbone_type).out_dim
+    if not args.dino_type:
+        target_size = BackboneFactory().create(args.backbone_type).out_dim
+    else:
+        target_size = BackboneFactory().create(
+            args.backbone_type, model_name=args.dino_type).out_dim
+
 
     print(
         f"\n{'='*70}\n[RUNNER] Inizio estrazione per SPLIT:"
@@ -260,6 +285,11 @@ def extract_all_configurations(args):
     )
     temporal_sampler = build_temporal_sampler(sampler_config)
 
+    if args.backbone_type == BackboneType.DINO:
+        nv = (IMAGE_NET_MEAN, IMAGE_NET_STD) 
+    else:
+        nv = (X3D_MEAN, X3D_STD)
+    
     dataset = ManifestVideoDataset(
         root=args.dataset_root,
         split=args.split,
@@ -270,6 +300,7 @@ def extract_all_configurations(args):
         temporal_sampler=temporal_sampler,
         spatial_mode=args.spatial_mode,
         color_mode=args.color,
+        normalization_vector=nv
     )
 
     loader = DataLoader(
@@ -293,6 +324,7 @@ def extract_all_configurations(args):
         backbone, _ = build_backbone_and_filename(
             config_type=cfg,
             backbone_type=args.backbone_type,
+            dino_type = args.dino_type,
             tracker_model_path=args.tracker_model_path,
         )
 
@@ -302,6 +334,7 @@ def extract_all_configurations(args):
             spatial_size=target_size,
             color=args.color,
             backbone=args.backbone_type.lower().replace("-", "_"),
+            dino_type = args.dino_type,
             tracker="yolov8n_coco" if "tracker" in cfg else "none",
             extra={
                 "transform": args.transform,
@@ -353,6 +386,7 @@ def main():
         choices=BackboneType.list_names(),
         default=BackboneType.X3D_L.value,
     )
+    parser.add_argument("--dino_type", type=str, default=None)
     parser.add_argument(
         "--tracker-model-path",
         default="yolov8n.pt",
