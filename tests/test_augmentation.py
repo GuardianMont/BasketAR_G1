@@ -101,6 +101,49 @@ class TestDatasetAndAugmentation(unittest.TestCase):
         expected_size = 7 + (3 * oversample_factor)
         self.assertEqual(len(ds_oversampled), expected_size)
 
+    def test_color_jitter_produces_no_nan_or_inf(self):
+        """Verifica che le trasformazioni cromatiche (color_jitter) non generino valori NaN o Inf.
+        
+        Prima della correzione dell'ordine di normalizzazione, la presenza di valori 
+        negativi nel tensore causava l'insorgere di NaN durante il ColorJitter.
+        """
+        transform = ClassAwareVideoTransform(
+            transform_names=["color_jitter", "gaussian_blur", "random_crop"],
+            minority_classes={self.minority_class_id},
+            mean=(0.485, 0.456, 0.406),
+            std=(0.229, 0.224, 0.225),
+        )
+
+        # Simula un tensore di clip valido non normalizzato in range [0, 1]
+        # Forma: (Channels=3, Time=16, Height=224, Width=224)
+        torch.manual_seed(42)
+        dummy_clip_unnorm = torch.rand(3, 16, 224, 224)
+        dummy_clip_raw = dummy_clip_unnorm.clone()
+
+        out_norm, out_raw, is_flipped = transform.apply_spatial_transforms(
+            dummy_clip_unnorm, dummy_clip_raw, label_id=self.minority_class_id
+        )
+
+        # 1. Verifica assenza di NaN e Inf sia in out_norm che in out_raw
+        self.assertFalse(
+            torch.isnan(out_norm).any().item(),
+            "out_norm contiene valori NaN dopo l'augmentation cromatica!",
+        )
+        self.assertFalse(
+            torch.isinf(out_norm).any().item(),
+            "out_norm contiene valori Inf dopo l'augmentation cromatica!",
+        )
+        self.assertFalse(
+            torch.isnan(out_raw).any().item(),
+            "out_raw contiene valori NaN!",
+        )
+
+        # 2. Verifica che il tensore trasformato sia stato effettivamente normalizzato (valori negativi e positivi ammessi)
+        self.assertTrue(
+            (out_norm < 0).any().item(),
+            "out_norm non risulta normalizzato con media e std!",
+        )
+
     @patch.object(ManifestVideoDataset, "_decode_clip")
     def test_unique_clip_ids_and_indexing(self, mock_decode_clip):
         """Verifica l'indicizzazione e l'assegnazione di clip_id univoci durante l'oversampling."""

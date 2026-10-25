@@ -1,15 +1,16 @@
 import random
+from typing import List, Optional, Set, Tuple
+
 import torch
-import torchvision.transforms as T
-import torchvision.transforms.functional as F
-from typing import List, Tuple, Optional
+import torchvision.transforms.v2 as v2
 
 
 class RandomTemporalShift:
     """
     Applies a random temporal offset during frame selection only if the
-    total number of frames eccedes a minimum threshold.
+    total number of frames exceeds a minimum threshold.
     """
+
     def __init__(self, min_frames_threshold: int = 16, shift_range: int = 4):
         self.min_frames_threshold = min_frames_threshold
         self.shift_range = shift_range
@@ -17,21 +18,20 @@ class RandomTemporalShift:
     def __call__(self, indices: List[int], total_frames: int) -> List[int]:
         if total_frames < self.min_frames_threshold or len(indices) == 0:
             return indices
-        
+
         shift = random.randint(-self.shift_range, self.shift_range)
-        shifted_indices = [max(0, min(total_frames - 1, idx + shift)) for idx in indices]
+        shifted_indices = [
+            max(0, min(total_frames - 1, idx + shift)) for idx in indices
+        ]
         if len(set(shifted_indices)) != len(shifted_indices):
             return indices
         return shifted_indices
 
-from typing import List, Optional, Set
-import torch
-import torchvision.transforms.v2 as v2
 
 class ClassAwareVideoTransform:
     """Gestisce trasformazioni multiple ed esegue l'augmentation 
 
-    usando esclusivamente torchvision.transforms.v2.
+    usando esclusivamente torchvision.transforms.v2 su tensori non normalizzati [0, 1].
     """
 
     def __init__(
@@ -40,6 +40,8 @@ class ClassAwareVideoTransform:
         minority_classes: Optional[Set[int]] = None,
         temporal_shift_range: int = 3,
         flip_probability: float = 0.5,
+        mean: Tuple[float, ...] = (0.485, 0.456, 0.406),
+        std: Tuple[float, ...] = (0.229, 0.224, 0.225),
     ):
         self.transform_names = [t for t in transform_names if t != "none"]
         self.minority_classes = minority_classes
@@ -69,6 +71,7 @@ class ClassAwareVideoTransform:
                 )
 
         self.v2_pipeline = v2.Compose(v2_ops) if v2_ops else None
+        self.normalizer = v2.Normalize(mean=mean, std=std)
 
     def should_apply(self, label_id: int) -> bool:
         if not self.transform_names:
@@ -83,26 +86,29 @@ class ClassAwareVideoTransform:
         return [max(0, min(total_frames - 1, idx + shift)) for idx in indices]
 
     def apply_spatial_transforms(
-        self, clip_norm: torch.Tensor, clip_raw: torch.Tensor, label_id: int
+        self, clip_unnorm: torch.Tensor, clip_raw: torch.Tensor, label_id: int
     ) -> Tuple[torch.Tensor, torch.Tensor, bool]:
-        """Applica flip orizzontale e augmentation v2 ai tensori (C, T, H, W)."""
+        """
+        Applica flip orizzontale e augmentation v2 al tensore NON normalizzato (C, T, H, W) [0, 1].
+        Applica infine la normalizzazione con media e deviazione standard prima di restituire.
+        """
         is_flipped = False
 
-        if not self.should_apply(label_id):
-            return clip_norm, clip_raw, is_flipped
+        # Applica augmentation solo se la classe è target
+        if self.should_apply(label_id):
+            if self.has_horizontal_flip and random.random() < self.flip_probability:
+                clip_unnorm = v2.functional.horizontal_flip(clip_unnorm)
+                clip_raw = v2.functional.horizontal_flip(clip_raw)
+                is_flipped = True
 
-        # Horizontal Flip nativo (funziona sia su C,T,H,W che T,C,H,W poiché agisce su W)
-        if self.has_horizontal_flip and random.random() < self.flip_probability:
-            clip_norm = v2.functional.horizontal_flip(clip_norm)
-            clip_raw = v2.functional.horizontal_flip(clip_raw)
-            is_flipped = True
+            if self.v2_pipeline is not None:
+                # Permuta in (T, C, H, W) affinché v2 legga C=3 in dim -3
+                clip_t = clip_unnorm.permute(1, 0, 2, 3)
+                clip_t = self.v2_pipeline(clip_t)  # Sicuro: operazione eseguita in range [0, 1]
+                clip_unnorm = clip_t.permute(1, 0, 2, 3)
 
-        # Altre trasformazioni spaziali/cromatiche v2
-        if self.v2_pipeline is not None:
-            # (C, T, H, W) -> (T, C, H, W) affinché torchvision legga C=3 al dim -3
-            clip_norm_t = clip_norm.permute(1, 0, 2, 3)
-            clip_norm_t = self.v2_pipeline(clip_norm_t)
-            # Ripristina (T, C, H, W) -> (C, T, H, W)
-            clip_norm = clip_norm_t.permute(1, 0, 2, 3)
+        # NORMALIZZAZIONE FINALE (Sia per campioni aumentati che non)
+        clip_t = clip_unnorm.permute(1, 0, 2, 3)
+        clip_norm = self.normalizer(clip_t).permute(1, 0, 2, 3)
 
         return clip_norm, clip_raw, is_flipped

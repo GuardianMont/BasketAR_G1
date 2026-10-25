@@ -29,6 +29,9 @@ from models import (
 from models.backbone import BackboneType, BackboneFactory
 from scripts.extract_features import extract_features_offline
 
+import torchvision.transforms.v2 as v2
+
+
 LABEL_TO_ID = {
     "passaggio": 0,
     "tiroDaDue0": 1,
@@ -194,12 +197,23 @@ class ManifestVideoDataset(Dataset):
         clip_norm = torch.stack(frames_norm, dim=1)  # (C, T, H, W)
         clip_raw = torch.stack(frames_raw, dim=1)    # (C, T, H, W)
 
+        frames_unnorm = [decoded_raw[i] for i in indices]  # Tensori [0, 1]
+        clip_unnorm = torch.stack(frames_unnorm, dim=1)    # (C, T, H, W)
+        clip_raw = clip_unnorm.clone()
+
         is_flipped = False
 
         if isinstance(self.transform, ClassAwareVideoTransform):
             clip_norm, clip_raw, is_flipped = self.transform.apply_spatial_transforms(
-                clip_norm, clip_raw, label_id
+                clip_unnorm, clip_raw, label_id
             )
+        else:
+            # Fallback 
+            normalizer = v2.Normalize(
+                mean=self.normalization_vector[0], std=self.normalization_vector[1]
+            )
+            clip_t = clip_unnorm.permute(1, 0, 2, 3)
+            clip_norm = normalizer(clip_t).permute(1, 0, 2, 3)
 
         return clip_norm, clip_raw, is_flipped
 
@@ -289,6 +303,8 @@ def extract_all_configurations(args):
         transform = ClassAwareVideoTransform(
             transform_names=transform_list,
             minority_classes=minority_set,
+            mean=IMAGE_NET_MEAN if args.backbone_type is BackboneType.DINO else X3D_MEAN,
+            std=IMAGE_NET_STD if args.backbone_type is BackboneType.DINO else X3D_STD
         )
     else:
         transform = None
