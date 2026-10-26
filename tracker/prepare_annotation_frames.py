@@ -8,10 +8,15 @@ Scelte di campionamento (per limitare i bias):
     tempo del video (start_time) per coprire inquadrature diverse;
   * 1 frame per clip, posizione casuale sull'intera clip (i tiri hanno una probabilità
     --shot-late-prob di essere presi nella parte finale, vicino al ferro);
+  * i file sono numerati (0001_..., 0002_...) in un ordine che mescola video e gruppi in modo
+    proporzionale: annotando in ordine alfabetico ogni prefisso (es. i primi 150) è già un
+    campione bilanciato, e puoi fermarti e addestrare quando vuoi;
   * idle/non-gioco inclusi: se la palla non c'è restano frame senza box (negativi).
 
 Fase 1:  python prepare_annotation_frames.py --dataset-root dataset_hd --out-dir annotation/br \
              --n-train 360 --n-val 80 [--prelabel --prelabel-weights yolo26m.pt]
+Round successivo senza ripescare clip già annotate:
+         ... --out-dir annotation/br2 --seed 43 --exclude annotation/br/index.csv
 Controllo bias dopo l'annotazione (labels/ esportate in YOLO nella stessa cartella):
          python prepare_annotation_frames.py --out-dir annotation/br --report
 """
@@ -77,6 +82,19 @@ def select_clips(rows: list[dict], n_total: int, quota: dict[str, float], rng: r
     return chosen
 
 
+def interleave(clips: list[dict], rng: random.Random) -> list[dict]:
+    """Ordina le clip mescolando proporzionalmente (video, gruppo): ogni prefisso della lista
+    ha circa le stesse proporzioni dell'insieme completo."""
+    cells: dict[tuple, list[dict]] = defaultdict(list)
+    for row in clips:
+        cells[(row["video_id"], row["group"])].append(row)
+    ranked = []
+    for items in cells.values():
+        rng.shuffle(items)
+        ranked += [((i + rng.uniform(0.1, 0.9)) / len(items), row) for i, row in enumerate(items)]
+    return [row for _, row in sorted(ranked, key=lambda t: t[0])]
+
+
 def read_frame(video: Path, index: int):
     cap = cv2.VideoCapture(str(video))
     if not cap.isOpened():
@@ -109,13 +127,20 @@ def extract(args) -> None:
     if args.prelabel:
         from ultralytics import YOLO
         model = YOLO(args.prelabel_weights)
+    excluded: set[str] = set()
+    for path in args.exclude:
+        with open(path, encoding="utf-8", newline="") as stream:
+            excluded |= {r["clip_id"] for r in csv.DictReader(stream)}
+    if excluded:
+        print(f"Escluse {len(excluded)} clip già usate in round precedenti")
     index_rows = []
     for split, count in (("train", args.n_train), ("val", args.n_val)):
         (out / "images" / split).mkdir(parents=True, exist_ok=True)
         if model:
             (out / "labels" / split).mkdir(parents=True, exist_ok=True)
-        clips = select_clips(read_manifest(manifest, split), count, quota, rng)
-        rng.shuffle(clips)
+        pool = [r for r in read_manifest(manifest, split) if r["clip_id"] not in excluded]
+        clips = select_clips(pool, count, quota, rng)
+        clips = interleave(clips, rng)
         saved = 0
         for row in clips:
             late = row["group"] == "shots" and rng.random() < args.shot_late_prob
@@ -128,7 +153,7 @@ def extract(args) -> None:
             frame, _ = read_frame(video, idx)
             if frame is None:
                 print(f"[WARN] frame {idx} non leggibile: {video}"); continue
-            name = f"{row['clip_id']}_f{idx:05d}"
+            name = f"{saved + 1:04d}_{row['clip_id']}_f{idx:05d}"
             cv2.imwrite(str(out / "images" / split / f"{name}.jpg"), frame, [cv2.IMWRITE_JPEG_QUALITY, 95])
             if model:
                 (out / "labels" / split / f"{name}.txt").write_text(
@@ -153,6 +178,7 @@ def report(args) -> None:
     for split in ("train", "val"):
         sub = [r for r in rows if r["split"] == split]
         stats, widths = [], []
+        widths_by_video = defaultdict(list)
         for r in sub:
             label_file = out / "labels" / split / (Path(r["image"]).stem + ".txt")
             lines = label_file.read_text().split("\n") if label_file.exists() else []
@@ -160,6 +186,7 @@ def report(args) -> None:
             img_w = cv2.imread(str(out / "images" / r["image"])).shape[1]
             balls = [b for b in boxes if b[0] == "0"]
             widths += [float(b[3]) * img_w for b in balls]
+            widths_by_video[r["video_id"]] += [float(b[3]) * img_w for b in balls]
             stats.append((r["video_id"], r["group"], bool(balls), any(b[0] == "1" for b in boxes), not boxes))
         print(f"\n== {split}: {len(sub)} frame ==")
         print("frame per video x gruppo:")
@@ -177,6 +204,10 @@ def report(args) -> None:
             q = np.percentile(widths, [10, 50, 90])
             print(f"larghezza palla (px, frame originale) P10/P50/P90 = {q[0]:.0f}/{q[1]:.0f}/{q[2]:.0f}; "
                   f"palle < 15px: {np.mean(np.array(widths) < 15):.0%} (box: {len(widths)})")
+            print("larghezza palla per video (px) P10/P50/P90 | % < 15px | n:")
+            for video, vw in sorted(widths_by_video.items()):
+                q = np.percentile(vw, [10, 50, 90])
+                print(f"  {video:15s} {q[0]:.0f}/{q[1]:.0f}/{q[2]:.0f} | {np.mean(np.array(vw) < 15):.0%} | {len(vw)}")
 
 
 def main() -> None:
@@ -189,8 +220,9 @@ def main() -> None:
     p.add_argument("--quota", default=DEFAULT_QUOTA)
     p.add_argument("--shot-late-prob", type=float, default=0.4)
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--exclude", nargs="*", default=[], help="index.csv di round precedenti: le loro clip non vengono ripescate")
     p.add_argument("--prelabel", action="store_true")
-    p.add_argument("--prelabel-weights", default="yolo26m.pt")
+    p.add_argument("--prelabel-weights", default="yolo11m.pt")
     p.add_argument("--prelabel-conf", type=float, default=0.05)
     p.add_argument("--imgsz", type=int, default=1280)
     p.add_argument("--report", action="store_true", help="statistiche delle label annotate (controllo bias)")
