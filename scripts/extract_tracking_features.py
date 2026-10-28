@@ -1,4 +1,4 @@
-"""Costruisce feature ball/rim dalla cache e le allinea al riferimento X3D."""
+"""Costruisce feature ball/rim dalla cache e le allinea al backbone di riferimento."""
 
 from __future__ import annotations
 
@@ -91,7 +91,7 @@ def _load_reference(path: Path, split: str) -> tuple[dict[str, Any], list[dict[s
         raise ValueError("Manca metadata['experiment_config'] nel riferimento.")
     sampler_config = experiment_config.get("sampler")
     if not isinstance(sampler_config, dict):
-        raise ValueError("Manca la configurazione sampler nell'esperimento X3D.")
+        raise ValueError("Manca la configurazione sampler nell'esperimento di riferimento.")
     # Fail early for unknown or malformed sampler configurations.
     build_temporal_sampler(sampler_config)
 
@@ -110,11 +110,11 @@ def _load_reference(path: Path, split: str) -> tuple[dict[str, Any], list[dict[s
 
     samples = payload.get("samples")
     if not isinstance(samples, list) or not samples:
-        raise ValueError("Il riferimento X3D non contiene samples validi.")
+        raise ValueError("Il riferimento non contiene samples validi.")
     reference_samples = []
     for sample in samples:
         if not isinstance(sample, dict) or sample.get("id") is None:
-            raise ValueError("Il riferimento X3D contiene un sample senza ID valido.")
+            raise ValueError("Il riferimento contiene un sample senza ID valido.")
         data = sample.get("data")
         if (
             not isinstance(data, torch.Tensor)
@@ -298,7 +298,7 @@ def _resample_features(
     previous = -1
     for output_index, frame_index in enumerate(sampled_indices):
         start = previous + 1
-        # Assign dense events to the next X3D step; include the unsampled tail
+        # Assign dense events to the next backbone step; include the unsampled tail
         # in the last step so a crossing after the final sample is not dropped.
         end = len(dense_features) - 1 if output_index == len(sampled_indices) - 1 else frame_index
         if start <= end:
@@ -358,6 +358,16 @@ def _gate_ball(candidates,times,sizes,max_speed,max_gap_s):
         else: rejected+=1
     return accepted,rejected
 
+def _group_step_end_indices(sampled_indices, frames_per_step):
+    """Map groups of sampled input frames to each backbone output step."""
+    if frames_per_step < 1:
+        raise ValueError("frames_per_step deve essere >= 1")
+    return [
+        sampled_indices[min(start + frames_per_step - 1, len(sampled_indices) - 1)]
+        for start in range(0, len(sampled_indices), frames_per_step)
+    ]
+
+
 def _window_features(dense,times,indices):
     result=_resample_features(dense,indices)
     for oi,idx in enumerate(indices):
@@ -390,9 +400,10 @@ def _window_features(dense,times,indices):
         if len(d): result[oi,_FEATURE_INDEX["ball_rim_min_distance_window"]]=float(np.min(d)); result[oi,_FEATURE_INDEX["ball_rim_window_valid"]]=1
     return result
 
-def _hash_tracker(detector_id,threshold,max_speed,max_gap_s,rim_expansion):
+def _hash_tracker(detector_id,threshold,max_speed,max_gap_s,rim_expansion,frames_per_step=1):
     cfg={"detector_id":detector_id,"threshold":threshold,"max_speed":max_speed,"max_gap_s":max_gap_s,
-         "rim_expansion":rim_expansion,"feature_schema":FEATURE_SCHEMA_VERSION}
+         "rim_expansion":rim_expansion,"frames_per_step":frames_per_step,
+         "feature_schema":FEATURE_SCHEMA_VERSION}
     return hashlib.sha256(json.dumps(cfg,sort_keys=True).encode()).hexdigest()[:16]
 
 def _write_tracking_preview(video_path,output_path,accepted,timestamps,fps,rejected=None,rim=None):
@@ -421,8 +432,11 @@ def _write_tracking_preview(video_path,output_path,accepted,timestamps,fps,rejec
 
 def extract_tracking_features(args):
     root=Path(args.dataset_root).resolve(); alignment,samples=_load_reference(Path(args.feature_reference).resolve(),args.split)
+    frames_per_step=getattr(args,"frames_per_step",1)
+    if not isinstance(frames_per_step,int) or frames_per_step<1:
+        raise ValueError("frames-per-step deve essere un intero >= 1")
     expected=getattr(args,"expected_experiment_id",None)
-    if expected and alignment["experiment_id"]!=expected: raise ValueError("experiment_id X3D non corrispondente")
+    if expected and alignment["experiment_id"]!=expected: raise ValueError("experiment_id del backbone non corrispondente")
     if args.limit is not None:
         if args.limit<=0: raise ValueError("limit deve essere > 0")
         samples=samples[:args.limit]; alignment["reference_sample_ids"]=alignment["reference_sample_ids"][:args.limit]
@@ -430,7 +444,7 @@ def extract_tracking_features(args):
     rows=_load_manifest(manifest,root,args.split,alignment["reference_sample_ids"])
     cache_dir=Path(args.detections_root or root/"detections")/args.detector_id/args.split
     outdir=Path(args.output_dir or root/"tracking"); outdir.mkdir(parents=True,exist_ok=True)
-    tid=_hash_tracker(args.detector_id,args.confidence_threshold,args.max_speed,args.max_gap_s,args.rim_expansion)
+    tid=_hash_tracker(args.detector_id,args.confidence_threshold,args.max_speed,args.max_gap_s,args.rim_expansion,frames_per_step)
     outpath=outdir/f"{args.split}__{alignment['experiment_id']}__trk-{tid}.pt"
     sampler=build_temporal_sampler(alignment["sampler_config"]); outputs=[]
     diag={"schema_version":2,"detector_id":args.detector_id,"tracker_id":tid,"clips":{}}
@@ -458,17 +472,25 @@ def extract_tracking_features(args):
         fps=float(c["fps"]); count=int(c["stream_frames"]) or len(dense)
         indices=sampler.sample_indices(count,fps=fps if fps>0 else None)
         if any(i<0 or i>=len(dense) for i in indices): raise ValueError(f"Indici sampler non decodificati: {ref['id']}")
-        if len(indices)!=ref["num_steps"]: raise ValueError(f"T diverso dal reference per {ref['id']}: {len(indices)} != {ref['num_steps']}")
-        sampled=_window_features(dense,times,indices)
+        expected_steps=(len(indices)+frames_per_step-1)//frames_per_step
+        if expected_steps!=ref["num_steps"]:
+            raise ValueError(
+                f"T diverso dal reference per {ref['id']}: con {len(indices)} frame campionati "
+                f"e frames_per_step={frames_per_step} sono attesi {expected_steps} passi, "
+                f"ma il reference ne contiene {ref['num_steps']}"
+            )
+        step_end_indices=_group_step_end_indices(indices,frames_per_step)
+        sampled=_window_features(dense,times,step_end_indices)
         assert sampled.shape[0]==ref["num_steps"],f"T diverso dal reference per {ref['id']}"
         outputs.append({"id":ref["id"],"data":torch.from_numpy(sampled.astype(np.float32))})
         count_cand=int(np.count_nonzero(np.any(ballraw[:,:,4]>0,axis=1)))
         diag["clips"][ref["id"]]={"ball_visibility_ratio":float(np.mean(ball[:,4]>0)),"rim_visibility_ratio":float(np.mean(rim[:,4]>0)),
             "gate_rejected_fraction":ngate/max(1,count_cand),"crossings":int(np.count_nonzero(dense[:,_FEATURE_INDEX["ball_crossed_rim_down"]]))}
         if args.save_previews: _write_tracking_preview(Path(row["_absolute_path"]),outdir/"previews"/f"{ref['id']}.mp4",ball,times,fps,rejected if args.show_rejected else None,rim)
-        print(f"[{n}/{len(rows)}] {ref['id']}: {len(dense)} frame densi -> {len(sampled)} passi X3D")
+        print(f"[{n}/{len(rows)}] {ref['id']}: {len(dense)} frame densi -> {len(sampled)} passi backbone")
     metadata={"split":args.split,"experiment_id":alignment["experiment_id"],"experiment_config":alignment["experiment_config"],
-        "detector_id":args.detector_id,"tracker_id":tid,"feature_schema_version":2,"feature_names":list(FEATURE_NAMES),
+        "detector_id":args.detector_id,"tracker_id":tid,"frames_per_step":frames_per_step,
+        "feature_schema_version":2,"feature_names":list(FEATURE_NAMES),
         "feature_groups":FEATURE_GROUPS,"missing_detection_policy":"Assenze a zero con maschere; nessun carry-forward o interpolazione."}
     if outpath.exists() and not args.overwrite: raise FileExistsError(f"Sidecar già presente: {outpath}")
     tmp=outpath.with_suffix(".pt.tmp"); torch.save({"metadata":metadata,"samples":outputs},tmp); os.replace(tmp,outpath)
@@ -480,12 +502,15 @@ def build_parser():
     p.add_argument("--expected-experiment-id"); p.add_argument("--detector-id",required=True); p.add_argument("--detections-root")
     p.add_argument("--confidence-threshold",type=float,required=True); p.add_argument("--max-speed",type=float,required=True)
     p.add_argument("--max-gap-s",type=float,required=True); p.add_argument("--rim-expansion",type=float,default=1.5)
+    p.add_argument("--frames-per-step",type=int,default=1,
+                   help="Numero di frame campionati aggregati per ciascun passo del backbone (default: 1).")
     p.add_argument("--output-dir"); p.add_argument("--limit",type=int); p.add_argument("--overwrite",action="store_true")
     p.add_argument("--save-previews",action="store_true"); p.add_argument("--show-rejected",action="store_true"); return p
 def main():
     a=build_parser().parse_args()
     if not 0<=a.confidence_threshold<=1: raise ValueError("confidence-threshold deve essere in [0,1]")
     if a.max_speed<=0 or a.max_gap_s<=0: raise ValueError("max-speed e max-gap-s devono essere > 0")
+    if a.frames_per_step<1: raise ValueError("frames-per-step deve essere >= 1")
     if a.rim_expansion<1: raise ValueError("rim-expansion deve essere >= 1")
     extract_tracking_features(a)
 
