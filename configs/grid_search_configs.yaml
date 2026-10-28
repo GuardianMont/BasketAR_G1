@@ -2,10 +2,6 @@ metadata:
   train_embeddings_path: "/home/emanuele/Documents/BasketAR_G1/features/train/train__videoswin__trackernone__edgedense32s100__stretch768__rgb__0a1a392c.pt"
   val_embeddings_path: "/home/emanuele/Documents/BasketAR_G1/features/val/val__videoswin__trackernone__edgedense32s100__stretch768__rgb__0a1a392c.pt"
   backbone_embed_dim: 768
-  phases:
-    - "p1"
-    - "p2"
-    - "p3"
   root_dir: "experiments"
   checkpoint_dir: "checkpoints"
   plot_dir: "plots"
@@ -17,7 +13,106 @@ global_train_params:
   patience: 12
   training_times: 5
   device: "cuda"
-  batch_size: 32
+
+##### GRID SEARCH 1 - Neck search #####
+# Combine this with `metadata` and `global_train_params` and:
+# batch size 32 for P1 and P2
+# batch size 8 for P3 (it seems it helps good convergence)
+
+grid1_neck_search:
+  neck:
+    BiGRU:
+      hidden_dim: [128, 256]
+      num_layers: [1, 2]
+      dropout: [0.2]
+    TCNNeck:
+      num_channels:
+        - [128, 256]
+        - [256, 512]
+        - [128, 256, 512]
+      kernel_size: [3, 5]
+      dropout: [0.2]
+  head:
+    MeanPooling: {}
+  loss:
+    CrossEntropy: {}
+  optimizer:
+    lr: [5e-4]
+    weight_decay: [1e-4]
+
+##### GRID SEARH 2 - Head and loss search #####
+
+grid2_head_search_p1:
+  neck:
+    BiGRU:
+      hidden_dim: [128]
+      num_layers: [2]
+      dropout: [0.2]
+  head:
+    MeanPooling:
+      hidden_dims:
+        - []
+        - [64]
+        - [64, 64]
+      dropout: [0.0, 0.2]
+    AttentionPooling:
+      dropout: [0.0, 0.2]
+  loss:
+    CrossEntropy: {}
+    FocalLoss:
+      gamma: [1.0, 2.0]
+  optimizer:
+    lr: [5e-4]
+    weight_decay: [1e-4, 5e-5]
+
+grid2_head_search_p2:
+  neck:
+    BiGRU:
+      hidden_dim: [256]
+      num_layers: [1]
+      dropout: [0.2]
+  head:
+    MeanPooling:
+      hidden_dims:
+        - []
+        - [64]
+        - [64, 64]
+      dropout: [0.0, 0.2]
+    AttentionPooling:
+      dropout: [0.0, 0.2]
+  loss:
+    CrossEntropy: {}
+    FocalLoss:
+      gamma: [1.0, 2.0]
+  optimizer:
+    lr: [5e-4]
+    weight_decay: [1e-4, 5e-5]
+
+grid2_head_search_p3:
+  neck:
+    BiGRU:
+      hidden_dim: [256]
+      num_layers: [2]
+      dropout: [0.2]
+  head:
+    MeanPooling:
+      hidden_dims:
+        - []
+        - [64]
+        - [64, 64]
+      dropout: [0.0, 0.2]
+    AttentionPooling:
+      dropout: [0.0, 0.2]
+  loss:
+    CrossEntropy: {}
+    FocalLoss:
+      gamma: [1.0, 2.0]
+  optimizer:
+    lr: [5e-4]
+    weight_decay: [1e-4, 5e-5]
+
+# -------------- OLD ------------------
+
 
 # Experiment 1: Architecture Search on neck
 neck_grid_search:

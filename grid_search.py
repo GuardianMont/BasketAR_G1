@@ -26,6 +26,8 @@ def parse_args():
     parser.add_argument("--global_config", type=str, default="global_train_params")
     parser.add_argument("--metadata", type=str, default="metadata")
     parser.add_argument("--experiment_name", type=str, default=None)
+    parser.add_argument("--phases", nargs='+', type=str, required=True, choices=['p1', 'p2', 'p3'])
+    parser.add_argument("--batch_size", type=int, default=32)
 
     parser.add_argument(
         "--report_only",
@@ -73,7 +75,7 @@ def main():
     
     training_times = global_train_params.get("training_times", 1)
     
-    phases = metadata["phases"]
+    phases = args.phases
 
     grid_results_dir = os.path.join(metadata["root_dir"], experiment_name)
     master_csv_path = os.path.join(grid_results_dir, "grid_results.csv")
@@ -114,7 +116,7 @@ def main():
         )
 
         train_loader, val_loader, class_weights = prepare_phase_data(
-            raw_train_samples, raw_val_samples, phase=phase, batch_size=global_train_params.get('batch_size', 8)
+            raw_train_samples, raw_val_samples, phase=phase, batch_size=args.batch_size
         )
 
         class_weights = class_weights.to(global_train_params["device"])
