@@ -30,6 +30,12 @@ class Trainer:
         self.device = device
         self.scheduler = scheduler
 
+    def _resolve_label_key(self, batch: dict, phase: str) -> str:
+        """Helper to resolve the correct label key for flat vs hierarchical phases."""
+        if phase == "flat":
+            return "label_orig" if "label_orig" in batch else "label_flat"
+        return f"label_{phase}"
+
     def fit(
         self,
         train_loader,
@@ -42,7 +48,6 @@ class Trainer:
         plot_path: str,
         desc: str = "Training",
     ) -> dict:
-        label_key = f"label_{phase}"
         best_f1 = 0.0
         best_loss = float("inf")
         best_acc = 0.0
@@ -58,6 +63,7 @@ class Trainer:
             self.model.train()
             train_loss = 0.0
             for batch in train_loader:
+                label_key = self._resolve_label_key(batch, phase)
                 x = batch["x"].to(self.device)
                 labels = batch[label_key].to(self.device)
                 lengths = batch["lengths"]
@@ -78,6 +84,7 @@ class Trainer:
 
             with torch.no_grad():
                 for batch in val_loader:
+                    label_key = self._resolve_label_key(batch, phase)
                     x = batch["x"].to(self.device)
                     labels = batch[label_key].to(self.device)
                     lengths = batch["lengths"]
@@ -156,7 +163,6 @@ class Trainer:
     ) -> dict:
         """Evaluates the model on a given data loader without calculating gradients."""
         self.model.eval()
-        label_key = f"label_{phase}"
         total_loss = 0.0
         all_preds, all_labels = [], []
 
@@ -164,6 +170,7 @@ class Trainer:
 
         with torch.no_grad():
             for batch in eval_pbar:
+                label_key = self._resolve_label_key(batch, phase)
                 x = batch["x"].to(self.device)
                 labels = batch[label_key].to(self.device)
                 lengths = batch["lengths"]
