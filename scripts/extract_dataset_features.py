@@ -226,7 +226,7 @@ def extract_all_configurations(args):
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    target_size = BackboneFactory().create(args.backbone_type).out_dim
+    target_size = args.spatial_size
 
     print(
         f"\n{'='*70}\n[RUNNER] Inizio estrazione per SPLIT:"
@@ -364,6 +364,12 @@ def main():
     )
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--workers", type=int, default=4)
+    parser.add_argument(
+        "--spatial-size",
+        type=int,
+        default=312,
+        help="Lato dei frame dopo il preprocessing spaziale (default: 312).",
+    )
     parser.add_argument("--num-frames", type=int, default=16)
     parser.add_argument(
         "--temporal-sampler",
@@ -394,6 +400,8 @@ def main():
     parser.add_argument("--overwrite", action="store_true")
 
     args = parser.parse_args()
+    if args.spatial_size <= 0:
+        parser.error("--spatial-size deve essere > 0")
     extract_all_configurations(args)
 
 
