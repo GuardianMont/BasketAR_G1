@@ -10,5 +10,5 @@ dataset_hd/*
 *.zip
 annotation/*
 *.pt
-
+configs/
 external_repo
