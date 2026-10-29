@@ -189,6 +189,46 @@ python evaluate_test.py \
   --test_name NOME_SEZIONE
 ```
 
+con un file di configurazione che deve avere una struttura del tipo:
+```yaml
+metadata:
+  train_embeddings_path: "path/to/train/embeddings.pt"
+  val_embeddings_path: "path/to/val/embeddings.pt"
+  backbone_embed_dim: EMBEDDING_DIM
+  root_dir: "experiments"
+  checkpoint_dir: "checkpoints"
+  plot_dir: "plots"
+  log_dir: "logs"
+  base_seed: 42
+
+global_train_params:
+  epochs: 100
+  patience: 12
+  training_times: 5
+  device: "cuda"
+
+grid_search_example:
+  neck:
+    BiGRU:
+      hidden_dim: [128, 256]
+      num_layers: [1, 2]
+      dropout: [0.2]
+    TCNNeck:
+      num_channels: # every bullet is a parameter
+        - [128, 256]
+        - [256, 512]
+        - [128, 256, 512]
+      kernel_size: [3, 5]
+      dropout: [0.2]
+  head:
+    MeanPooling: {} # {} = default params
+  loss:
+    CrossEntropy: {}
+  optimizer:
+    lr: [5e-4]
+    weight_decay: [1e-4]
+```
+
 Per eseguire la valutazione gerarchica completa:
 
 ```bash
