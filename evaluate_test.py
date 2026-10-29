@@ -92,11 +92,8 @@ def parse_yaml_config(args, yaml_object):
 def build_and_load_model(phase: str, arch_config: Dict[str, Any], metadata: Dict[str, Any], device: torch.device):
     """Utility function to instantiate, load weights, and wrap a single model phase."""
     use_tracker = arch_config.get("use_tracker", False)
-    visual_dim = metadata.get("visual_embed_dim", 768)
+    in_dim = metadata["backbone_embed_dim"] - 45 if not use_tracker else metadata["backbone_embed_dim"]
     
-    # Calculate effective input dimension based on tracking flag
-    in_dim = metadata["backbone_embed_dim"] if use_tracker else visual_dim
-
     neck, neck_out_dim = NeckFactory.create(
         neck_type=NeckType(arch_config["neck_type"]),
         kwargs=arch_config["neck_kwargs"],
@@ -258,9 +255,22 @@ def main():
     results_csv_path = os.path.join(output_dir, "test_results.csv")
 
     print(f"[INFO] Loading Train and Test embeddings...")
+    any_tracker_used = any(
+        arch_config.get("use_tracker", False)
+        for phase, arch_config in test_architectures.items()
+        if isinstance(arch_config, dict)
+    )
+
+    # Se il tracker è attivo in una fase, la dimensione attesa per il train viene ridotta di 45
+    # (il train viene usato solo per estrarre le etichette per i pesi delle classi)
+    train_expected_dim = metadata["backbone_embed_dim"]
+    if any_tracker_used:
+        train_expected_dim -= 45
+
+    print(f"[INFO] Loading Train and Test embeddings...")
     raw_train_samples = FeatureLoader.load(
         metadata["train_embeddings_path"],
-        expected_dim=metadata["backbone_embed_dim"],
+        expected_dim=train_expected_dim,
         expected_experiment_id=None,
     )
     raw_test_samples = FeatureLoader.load(
