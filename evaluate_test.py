@@ -2,8 +2,9 @@ import argparse
 import os
 import pandas as pd
 import torch
+import torch.nn as nn
 import yaml
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 
 from data.phase_manager import PHASE_CONFIGS, prepare_phase_data
 from utils.feature_loader import FeatureLoader
@@ -20,6 +21,22 @@ from sklearn.metrics import accuracy_score, f1_score, confusion_matrix
 from tqdm import tqdm
 
 from utils.plotting import save_confusion_matrix_plot, map_to_p2_labels, CLASS_NAMES_NOACTION, CLASS_NAMES_P2
+
+
+class FeatureSlicerWrapper(nn.Module):
+    """Wrapper module that slices visual features on-the-fly 
+
+    if tracking features are disabled for a specific phase.
+    """
+    def __init__(self, model: nn.Module, target_dim: int):
+        super().__init__()
+        self.model = model
+        self.target_dim = target_dim
+
+    def forward(self, x: torch.Tensor, lengths: Optional[torch.Tensor] = None) -> torch.Tensor:
+        if x.shape[-1] > self.target_dim:
+            x = x[..., :self.target_dim]
+        return self.model(x, lengths=lengths)
 
 
 def parse_args():
@@ -73,11 +90,14 @@ def parse_yaml_config(args, yaml_object):
 
 
 def build_and_load_model(phase: str, arch_config: Dict[str, Any], metadata: Dict[str, Any], device: torch.device):
-    """Utility function to instantiate and load weights for a single model phase."""
+    """Utility function to instantiate, load weights, and wrap a single model phase."""
+    use_tracker = arch_config.get("use_tracker", False)
+    in_dim = metadata["backbone_embed_dim"] - 45 if not use_tracker else metadata["backbone_embed_dim"]
+    
     neck, neck_out_dim = NeckFactory.create(
         neck_type=NeckType(arch_config["neck_type"]),
         kwargs=arch_config["neck_kwargs"],
-        in_dim=metadata["backbone_embed_dim"],
+        in_dim=in_dim,
     )
 
     head = HeadFactory.create(
@@ -87,19 +107,21 @@ def build_and_load_model(phase: str, arch_config: Dict[str, Any], metadata: Dict
         num_classes=PHASE_CONFIGS[phase]["num_classes"],
     )
 
-    model = ARPipeline(backbone=None, neck=neck, head=head)
+    pipeline = ARPipeline(backbone=None, neck=neck, head=head)
     
     ckpt_path = arch_config["checkpoint_path"]
     if not os.path.exists(ckpt_path):
         raise FileNotFoundError(f"Checkpoint for phase '{phase}' not found at: {ckpt_path}")
         
-    print(f"[INFO] Loading {phase.upper()} checkpoint: {ckpt_path}")
+    print(f"[INFO] Loading {phase.upper()} checkpoint (use_tracker={use_tracker}, in_dim={in_dim}): {ckpt_path}")
     state_dict = torch.load(ckpt_path, map_location=device)
     if "model_state_dict" in state_dict:
-        model.load_state_dict(state_dict["model_state_dict"])
+        pipeline.load_state_dict(state_dict["model_state_dict"])
     else:
-        model.load_state_dict(state_dict)
+        pipeline.load_state_dict(state_dict)
 
+    # Wrap model to slice tracker features automatically if use_tracker is False
+    model = FeatureSlicerWrapper(pipeline, target_dim=in_dim)
     model.to(device)
     model.eval()
     return model
@@ -204,7 +226,6 @@ def evaluate_downstream(args, metadata, global_params, test_architectures, raw_t
     print(cm)
 
     p2_metrics = evaluate_p2_downstream(all_labels, all_preds, output_dir)
-    # 5. Salvataggio
     results_csv_path = os.path.join(output_dir, "downstream_results.csv")
     df_results = pd.DataFrame([{
         "inference_type": "hierarchical_downstream",
@@ -234,9 +255,22 @@ def main():
     results_csv_path = os.path.join(output_dir, "test_results.csv")
 
     print(f"[INFO] Loading Train and Test embeddings...")
+    any_tracker_used = any(
+        arch_config.get("use_tracker", False)
+        for phase, arch_config in test_architectures.items()
+        if isinstance(arch_config, dict)
+    )
+
+    # Se il tracker è attivo in una fase, la dimensione attesa per il train viene ridotta di 45
+    # (il train viene usato solo per estrarre le etichette per i pesi delle classi)
+    train_expected_dim = metadata["backbone_embed_dim"]
+    if any_tracker_used:
+        train_expected_dim -= 45
+
+    print(f"[INFO] Loading Train and Test embeddings...")
     raw_train_samples = FeatureLoader.load(
         metadata["train_embeddings_path"],
-        expected_dim=metadata["backbone_embed_dim"],
+        expected_dim=train_expected_dim,
         expected_experiment_id=None,
     )
     raw_test_samples = FeatureLoader.load(
@@ -303,6 +337,7 @@ def main():
             "neck_type": arch_config["neck_type"],
             "neck_kwargs": str(arch_config["neck_kwargs"]),
             "head_type": arch_config["head_type"],
+            "use_tracker": arch_config.get("use_tracker", False),
             "checkpoint_path": ckpt_path,
             "test_loss": test_loss,
             "test_accuracy": test_acc,
