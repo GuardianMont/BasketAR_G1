@@ -27,6 +27,7 @@ class ExperimentConfig:
     spatial_size: int = 312
     color: str = "rgb"
     backbone: str = "x3d_l"
+    dino_type: str = None
     tracker: str = "none"
     neck: Optional[str] = None
     head: Optional[str] = None
@@ -64,7 +65,7 @@ class ExperimentConfig:
         readable = "__".join(
             _slug(value)
             for value in (
-                self.backbone,
+                self.backbone if not self.dino_type else self.dino_type,
                 f"tracker-{self.tracker}",
                 sampler_label,
                 spatial_label,

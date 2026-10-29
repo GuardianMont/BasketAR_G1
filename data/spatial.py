@@ -6,12 +6,11 @@ import torch
 import torchvision.transforms.functional as F
 
 
-X3D_MEAN = (0.45, 0.45, 0.45)
-X3D_STD = (0.225, 0.225, 0.225)
-
 
 def preprocess_frame(
     frame,
+    mean_norm_vector: tuple[float],
+    std_norm_vector: tuple[float],
     spatial_mode: str = "letterbox",
     spatial_size: int = 312,
     color_mode: str = "rgb",
@@ -62,5 +61,5 @@ def preprocess_frame(
     if color_mode == "grayscale":
         x_raw = F.rgb_to_grayscale(x_raw, num_output_channels=3)
 
-    x_norm = F.normalize(x_raw, mean=X3D_MEAN, std=X3D_STD)
+    x_norm = F.normalize(x_raw, mean=mean_norm_vector, std=std_norm_vector)
     return x_norm, x_raw

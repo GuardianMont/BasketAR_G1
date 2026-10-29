@@ -1,0 +1,64 @@
+metadata:
+  # Train path is needed for weights
+  train_embeddings_path: "features/train/train__videoswin__trackernone__edgedense32s100__stretch768__rgb__0a1a392c.pt"
+  test_embeddings_path: "features/test/test__videoswin__trackernone__edgedense32s100__stretch768__rgb__0a1a392c.pt"
+  backbone_embed_dim: 768
+  phases:
+    - "p1"
+    - "p2"
+    - "p3"
+  output_dir: "experiments/final_evaluation"
+
+metadata_val:
+  # Train path is needed for weights
+  train_embeddings_path: "features/train/train__videoswin__trackernone__edgedense32s100__stretch768__rgb__0a1a392c.pt"
+  test_embeddings_path: "features/val/val__videoswin__trackernone__edgedense32s100__stretch768__rgb__0a1a392c.pt"
+  backbone_embed_dim: 768
+  phases:
+    - "p1"
+    - "p2"
+    - "p3"
+  output_dir: "experiments/final_evaluation"
+
+global_params:
+  device: "cuda"
+
+# Configurazione delle migliori architetture individuate per fase
+best_architectures:
+  p1:
+    neck_type: "TCNNeck"
+    neck_kwargs:
+      num_channels: [128, 256]
+      kernel_size: 3
+    head_type: "MeanPooling"
+    head_kwargs:
+      hidden_dims: []
+      dropout: 0.2
+    loss_type: "FocalLoss"
+    loss_kwargs: {}
+    checkpoint_path: "experiments/p1_optim/p1/TCNNeck_exp_264_rep_3.pt"
+
+  p2:
+    neck_type: "BiGRU"
+    neck_kwargs:
+      hidden_dim: 128
+      num_layers: 1
+      dropout: 0.4
+    head_type: "MeanPooling"
+    head_kwargs:
+      hidden_dims: []
+      dropout: 0.0
+    loss_type: "CrossEntropy"
+    loss_kwargs: {}
+    checkpoint_path: "experiments/p2_optim/p2/BiGRU_exp_73_rep_2.pt"
+
+  p3:
+    neck_type: "Identity"
+    neck_kwargs: {}
+    head_type: "MeanPooling"
+    head_kwargs:
+      hidden_dims: [64, 64]
+      dropout: 0.0
+    loss_type: "CrossEntropy"
+    loss_kwargs: {}
+    checkpoint_path: "experiments/p3_fitting/p3/Identity_exp_26_rep_1.pt"

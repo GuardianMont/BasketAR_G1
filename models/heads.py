@@ -3,17 +3,61 @@ Implementations of classification heads for action recognition.
 """
 import torch
 import torch.nn as nn
-from typing import Optional
+from typing import Any, Dict, Optional
+from .base import BaseClassifierHead, BaseTypeEnum
 
-from .base import BaseClassifierHead
+
+class HeadType(BaseTypeEnum):
+    """Enumeration of supported classification head types."""
+    MEAN_POOLING = "MeanPooling"
+    ATTENTION_POOLING = "AttentionPooling"
+
+import torch
+import torch.nn as nn
+from typing import Optional, Union, List
 
 
 class MeanPoolingClassifierHead(BaseClassifierHead):
-    """Classification head using Global Temporal Average Pooling."""
-    def __init__(self, in_dim: int, num_classes: int = 9, dropout: float = 0.3):
+    """
+    Classification head using Global Temporal Average Pooling.
+    """
+    def __init__(
+        self,
+        in_dim: int,
+        num_classes: int = 9,
+        dropout: float = 0.3,
+        hidden_dims: Optional[Union[int, List[int]]] = None,
+    ):
         super().__init__(in_dim=in_dim, num_classes=num_classes)
-        self.dropout = nn.Dropout(dropout)
-        self.fc = nn.Linear(in_dim, num_classes)
+
+        # Normalize hidden_dims parameter into a list of integers
+        if hidden_dims is None:
+            hidden_dims_list = []
+        elif isinstance(hidden_dims, int):
+            hidden_dims_list = [hidden_dims] if hidden_dims > 0 else []
+        else:
+            hidden_dims_list = list(hidden_dims)
+
+        layers = []
+        curr_dim = in_dim
+
+        if not hidden_dims_list:
+            # Base case: Dropout -> Linear(in_dim, num_classes)
+            if dropout > 0.0:
+                layers.append(nn.Dropout(dropout))
+            layers.append(nn.Linear(curr_dim, num_classes))
+        else:
+            # MLP case: (Linear -> ReLU -> Dropout) per hidden layer
+            for h_dim in hidden_dims_list:
+                layers.append(nn.Linear(curr_dim, h_dim))
+                layers.append(nn.ReLU())
+                if dropout > 0.0:
+                    layers.append(nn.Dropout(dropout))
+                curr_dim = h_dim
+            # Final projection layer
+            layers.append(nn.Linear(curr_dim, num_classes))
+
+        self.classifier = nn.Sequential(*layers)
 
     def forward(
         self,
@@ -29,14 +73,14 @@ class MeanPoolingClassifierHead(BaseClassifierHead):
                 < lengths[:, None]
             ).unsqueeze(-1)
             x_pooled = (x * mask).sum(dim=1) / lengths.unsqueeze(1)
-        logits = self.fc(self.dropout(x_pooled))
+
+        logits = self.classifier(x_pooled)
         return logits
 
-# In models/heads.py:
 class AttentionClassifierHead(nn.Module):
     """
-    Applica un'attenzione temporale sui 16 step prima del classificatore.
-    Impara a pesare maggiormente i frame decisivi (es. il rilascio del tiro).
+    Implements a classification head with temporal attention pooling.
+    This head learns to focus on the most informative temporal segments of the input sequence.
     """
     def __init__(self, in_dim: int, num_classes: int = 9, dropout: float = 0.2):
         super().__init__()
@@ -65,3 +109,25 @@ class AttentionClassifierHead(nn.Module):
         
         out = self.dropout(context)
         return self.fc(out)
+
+
+class HeadFactory:
+    """Static method to create a classification head based on the specified type and configuration."""
+    
+    @staticmethod
+    def create(head_type: str | HeadType, kwargs: Dict[str, Any], in_dim: int, num_classes: int) -> nn.Module:
+        head_type = HeadType.from_str(head_type)
+        if head_type == HeadType.MEAN_POOLING:
+            return MeanPoolingClassifierHead(
+                in_dim=in_dim,
+                num_classes=num_classes,
+                **kwargs
+            )
+        elif head_type == HeadType.ATTENTION_POOLING:
+            return AttentionClassifierHead(
+                in_dim=in_dim,
+                num_classes=num_classes,
+                **kwargs
+            )
+        else:
+            raise ValueError(f"Unsupported: {head_type}")
