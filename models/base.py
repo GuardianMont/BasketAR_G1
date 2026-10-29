@@ -2,7 +2,8 @@
 Contains abstract base interfaces for all modular components of the architecture.
 """
 from abc import ABC, abstractmethod
-from typing import Optional
+from typing import Optional, TypeVar, Type
+from enum import Enum
 import torch
 import torch.nn as nn
 
@@ -58,3 +59,34 @@ class BaseClassifierHead(nn.Module, ABC):
     @abstractmethod
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         pass
+
+
+T = TypeVar("T", bound="BaseTypeEnum")
+
+class BaseTypeEnum(str, Enum):
+    """Provides a method to instantiate enum members from string labels.
+    Type enums should inherit from this class to support case-insensitive string conversion.
+    Used for NeckType, HeadType, and LossType enums."""
+
+    @classmethod
+    def from_str(cls: Type[T], label: str) -> T:
+        """Converts a string label to the corresponding enum member."""
+        if isinstance(label, cls):
+            return label
+        
+        if not isinstance(label, str):
+            raise TypeError(f"Required a string or {cls.__name__}, got {type(label)}")
+
+        clean_label = label.strip().lower()
+
+        for member in cls:
+            if member.value.lower() == clean_label or member.name.lower() == clean_label:
+                return member
+
+        valid_values = [m.value for m in cls]
+        raise ValueError(
+            f"Type '{label}' is not valid for {cls.__name__}. Supported values: {valid_values}"
+        )
+
+    def __str__(self) -> str:
+        return self.value

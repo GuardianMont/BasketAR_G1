@@ -1,0 +1,356 @@
+metadata:
+  train_embeddings_path: "/home/emanuele/Documents/BasketAR_G1/features/train/train__videoswin__trackernone__edgedense32s100__stretch768__rgb__0a1a392c.pt"
+  val_embeddings_path: "/home/emanuele/Documents/BasketAR_G1/features/val/val__videoswin__trackernone__edgedense32s100__stretch768__rgb__0a1a392c.pt"
+  backbone_embed_dim: 768
+  root_dir: "experiments"
+  checkpoint_dir: "checkpoints"
+  plot_dir: "plots"
+  log_dir: "logs"
+  base_seed: 42
+
+global_train_params:
+  epochs: 100
+  patience: 12
+  training_times: 5
+  device: "cuda"
+
+##### GRID SEARCH 1 - Neck search #####
+# Combine this with `metadata` and `global_train_params` and:
+# batch size 32 for P1 and P2
+# batch size 8 for P3 (it seems it helps good convergence)
+
+grid1_neck_search:
+  neck:
+    BiGRU:
+      hidden_dim: [128, 256]
+      num_layers: [1, 2]
+      dropout: [0.2]
+    TCNNeck:
+      num_channels:
+        - [128, 256]
+        - [256, 512]
+        - [128, 256, 512]
+      kernel_size: [3, 5]
+      dropout: [0.2]
+  head:
+    MeanPooling: {}
+  loss:
+    CrossEntropy: {}
+  optimizer:
+    lr: [5e-4]
+    weight_decay: [1e-4]
+
+##### GRID SEARH 2 - Head and loss search #####
+
+grid2_head_search_p1:
+  neck:
+    BiGRU:
+      hidden_dim: [128]
+      num_layers: [2]
+      dropout: [0.2]
+  head:
+    MeanPooling:
+      hidden_dims:
+        - []
+        - [64]
+        - [64, 64]
+      dropout: [0.0, 0.2]
+    AttentionPooling:
+      dropout: [0.0, 0.2]
+  loss:
+    CrossEntropy: {}
+    FocalLoss:
+      gamma: [1.0, 2.0]
+  optimizer:
+    lr: [5e-4]
+    weight_decay: [1e-4, 5e-5]
+
+grid2_head_search_p2:
+  neck:
+    BiGRU:
+      hidden_dim: [256]
+      num_layers: [1]
+      dropout: [0.2]
+  head:
+    MeanPooling:
+      hidden_dims:
+        - []
+        - [64]
+        - [64, 64]
+      dropout: [0.0, 0.2]
+    AttentionPooling:
+      dropout: [0.0, 0.2]
+  loss:
+    CrossEntropy: {}
+    FocalLoss:
+      gamma: [1.0, 2.0]
+  optimizer:
+    lr: [5e-4]
+    weight_decay: [1e-4, 5e-5]
+
+grid2_head_search_p3:
+  neck:
+    BiGRU:
+      hidden_dim: [256]
+      num_layers: [2]
+      dropout: [0.2]
+  head:
+    MeanPooling:
+      hidden_dims:
+        - []
+        - [64]
+        - [64, 64]
+      dropout: [0.0, 0.2]
+    AttentionPooling:
+      dropout: [0.0, 0.2]
+  loss:
+    CrossEntropy: {}
+    FocalLoss:
+      gamma: [1.0, 2.0]
+  optimizer:
+    lr: [5e-4]
+    weight_decay: [1e-4, 5e-5]
+
+# -------------- OLD ------------------
+
+
+# Experiment 1: Architecture Search on neck
+neck_grid_search:
+  neck:
+    BiGRU:
+      hidden_dim: [128, 256]
+      num_layers: [1, 2]
+    TCNNeck:
+      num_channels:
+        - [128, 256]
+        - [256, 512]
+        - [128, 256, 512]
+      kernel_size: [3, 5]
+  head:
+    MeanPooling: {}
+  loss:
+    CrossEntropy: {}
+  optimizer:
+    lr: [5e-4]
+    weight_decay: [0.0]
+
+# Experiment 2: regularization
+neck_grid_search_regularized:
+  neck:
+    BiGRU:
+      hidden_dim: [128, 256]
+      num_layers: [1, 2]
+    TCNNeck:
+      num_channels:
+        - [128, 256]
+        - [256, 512]
+        - [128, 256, 512]
+      kernel_size: [3, 5]
+  head:
+    MeanPooling: {}
+  loss:
+    CrossEntropy: {}
+  optimizer:
+    lr: [5e-4]
+    weight_decay: [1e-3, 1e-4]
+
+# Rationale: in previous runs BiGRU was better, so for simplicity here I'll use just BiGRU
+#   The train-val curves all showed the same behaviour: smooth minimized loss and rough
+#   validation loss. The instability on the latter makes me think that LR is too high
+#   dropout was inserted for testing purposes.
+#   NOTE: it seems that LR should be lowered for latter architecture components, that's
+#         what i'm testing here.
+neck_grid_search_regularized_dropout:
+  neck:
+    BiGRU:
+      hidden_dim: [128, 256]
+      num_layers: [1, 2]
+      dropout: [0.2]
+  head:
+    MeanPooling: {}
+  loss:
+    CrossEntropy: {}
+  optimizer:
+    lr: [1e-4, 5e-5]
+    weight_decay: [1e-4]
+
+# Experiment 5: optimize neck for p1 and p2 (to use with specific metadata)
+neck_regularized_dropout_p1_p2:
+  neck:
+    BiGRU:
+      hidden_dim: [128, 256]
+      num_layers: [1, 2]
+      dropout: [0.2]
+    TCNNeck:
+      num_channels:
+        - [128, 256]
+        - [256, 512]
+        - [128, 256, 512]
+      kernel_size: [3, 5]
+      dropout: [0.2]
+  head:
+    MeanPooling: {}
+  loss:
+    CrossEntropy: {}
+  optimizer:
+    lr: [1e-4, 5e-5]
+    weight_decay: [1e-4, 1e-5]
+
+# Experiment 6: Optimize classification layer P1
+p1_optim:
+  neck:
+    TCNNeck:
+      num_channels: 
+        - [128, 256]
+      kernel_size: [3]
+      dropout: [0.2, 0.3, 0.4]
+  head:
+    MeanPooling:
+      hidden_dims:
+        - []
+        - [64]
+        - [64, 64]
+      dropout: [0.0, 0.2, 0.3]
+    AttentionPooling:
+      dropout: [0.0, 0.2, 0.3]
+  loss:
+    CrossEntropy: {}
+    FocalLoss:
+      gamma: [1.0, 2.0]
+  optimizer:
+    lr: [1e-4, 5e-5]
+    weight_decay: [1e-4, 1e-5]
+
+# Experiment 7: Optimize classification layer P2
+p2_optim:
+  neck:
+    BiGRU:
+      hidden_dim: [128]
+      num_layers: [1]
+      dropout: [0.2, 0.3, 0.4]
+  head:
+    MeanPooling:
+      hidden_dims:
+        - []
+        - [64]
+        - [64, 64]
+      dropout: [0.0, 0.2, 0.3]
+    AttentionPooling:
+      dropout: [0.0, 0.2, 0.3]
+  loss:
+    CrossEntropy: {}
+    FocalLoss:
+      gamma: [1.0, 2.0]
+  optimizer:
+    lr: [1e-4, 5e-5]
+    weight_decay: [1e-4, 1e-5]
+
+      
+
+p1_p2_meta:
+  train_embeddings_path: "/home/emanuele/Documents/BasketAR_G1/features/train/train__videoswin__trackernone__edgedense32s100__stretch768__rgb__0a1a392c.pt"
+  val_embeddings_path: "/home/emanuele/Documents/BasketAR_G1/features/val/val__videoswin__trackernone__edgedense32s100__stretch768__rgb__0a1a392c.pt"
+  backbone_embed_dim: 768
+  phases:
+    - "p1"
+    - "p2"
+  root_dir: "experiments"
+  checkpoint_dir: "checkpoints"
+  plot_dir: "plots"
+  log_dir: "logs"
+  base_seed: 42
+
+p1_meta:
+  train_embeddings_path: "/home/emanuele/Documents/BasketAR_G1/features/train/train__videoswin__trackernone__edgedense32s100__stretch768__rgb__0a1a392c.pt"
+  val_embeddings_path: "/home/emanuele/Documents/BasketAR_G1/features/val/val__videoswin__trackernone__edgedense32s100__stretch768__rgb__0a1a392c.pt"
+  backbone_embed_dim: 768
+  phases:
+    - "p1"
+  root_dir: "experiments"
+  checkpoint_dir: "checkpoints"
+  plot_dir: "plots"
+  log_dir: "logs"
+  base_seed: 42
+
+p2_meta:
+  train_embeddings_path: "/home/emanuele/Documents/BasketAR_G1/features/train/train__videoswin__trackernone__edgedense32s100__stretch768__rgb__0a1a392c.pt"
+  val_embeddings_path: "/home/emanuele/Documents/BasketAR_G1/features/val/val__videoswin__trackernone__edgedense32s100__stretch768__rgb__0a1a392c.pt"
+  backbone_embed_dim: 768
+  phases:
+    - "p2"
+  root_dir: "experiments"
+  checkpoint_dir: "checkpoints"
+  plot_dir: "plots"
+  log_dir: "logs"
+  base_seed: 42
+
+# Experiment 4: no neck, simple classifiers for P3
+p3_fitting:
+  neck:
+    Identity: {}
+  head:
+    MeanPooling:
+      hidden_dims:
+        - [0]
+        - [64]
+        - [64, 64]
+      dropout: [0.0, 0.2, 0.3]
+    AttentionPooling:
+      dropout: [0.0, 0.2, 0.3]
+  loss:
+    CrossEntropy: {}
+  optimizer:
+    lr: [1e-4, 5e-5]
+    weight_decay: [1e-4, 1e-5]
+
+p3_fitting_metadata:
+  train_embeddings_path: "/home/emanuele/Documents/BasketAR_G1/features/train/train__videoswin__trackernone__edgedense32s100__stretch768__rgb__0a1a392c.pt"
+  val_embeddings_path: "/home/emanuele/Documents/BasketAR_G1/features/val/val__videoswin__trackernone__edgedense32s100__stretch768__rgb__0a1a392c.pt"
+  backbone_embed_dim: 768
+  phases:
+    - "p3"
+  root_dir: "experiments"
+  checkpoint_dir: "checkpoints"
+  plot_dir: "plots"
+  log_dir: "logs"
+  base_seed: 42
+
+# ----------- TESTS --------------
+
+
+test_metadata:
+  train_embeddings_path: "/home/emanuele/Documents/BasketAR_G1/features/train/train__videoswin__trackernone__edgedense32s100__stretch768__rgb__0a1a392c.pt"
+  val_embeddings_path: "/home/emanuele/Documents/BasketAR_G1/features/val/val__videoswin__trackernone__edgedense32s100__stretch768__rgb__0a1a392c.pt"
+  backbone_embed_dim: 768
+  phases:
+    - "p1"
+  root_dir: "experiments"
+  checkpoint_dir: "checkpoints"
+  plot_dir: "plots"
+  log_dir: "logs"
+
+test_experiment:
+  neck:
+    TCNNeck:
+      num_channels: [[256, 512]]
+      kernel_size: [3]
+  head:
+    AttentionPooling: {}
+  loss:
+    CrossEntropy: {}
+  optimizer:
+    lr: [5e-4]
+    weight_decay: [0.0]
+
+# Experiment 2: Future Example of Fine-Tuning the Optimizer (Phase 2)
+optimizer_tuning:
+  neck:
+    # The winning Neck from Phase 1 fixed
+    TCNNeck:
+      num_channels: [[256, 512]]
+      kernel_size: [3]
+  head:
+    AttentionPooling: {}
+  optimizer:
+    lr: [5e-4, 5e-5, 5e-6]
+    weight_decay: [0.0, 0.01, 0.001]
