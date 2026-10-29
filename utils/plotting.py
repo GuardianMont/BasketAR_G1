@@ -6,11 +6,6 @@ import seaborn as sns
 from sklearn.metrics import confusion_matrix
 from torchvision.transforms import ToTensor
 
-PHASE_CLASS_NAMES = {
-    "p1": ["passaggio", "tiro", "altro"],
-    "p2": ["tiroDaDue", "tiroDaTre", "tiroLibero"],
-    "p3": ["sbagliato", "segnato"],
-}
 
 CLASS_NAMES = [
     "passaggio",
@@ -23,6 +18,13 @@ CLASS_NAMES = [
     "idle",
     "non-gioco",
 ]
+
+PHASE_CLASS_NAMES = {
+    "p1": ["passaggio", "tiro", "altro"],
+    "p2": ["tiroDaDue", "tiroDaTre", "tiroLibero"],
+    "p3": ["sbagliato", "segnato"],
+    "flat": CLASS_NAMES,
+}
 
 CLASS_NAMES_NOACTION = [
     "passaggio",

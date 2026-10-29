@@ -26,7 +26,7 @@ def parse_args():
     parser.add_argument("--global_config", type=str, default="global_train_params")
     parser.add_argument("--metadata", type=str, default="metadata")
     parser.add_argument("--experiment_name", type=str, default=None)
-    parser.add_argument("--phases", nargs='+', type=str, required=True, choices=['p1', 'p2', 'p3'])
+    parser.add_argument("--phases", nargs='+', type=str, required=True, choices=['p1', 'p2', 'p3', 'flat'])
     parser.add_argument("--batch_size", type=int, default=32)
 
     parser.add_argument(
@@ -67,8 +67,8 @@ def main():
 
     experiment_name = args.experiment_name if args.experiment_name else args.grid_name
     
-    metadata:Dict[str, str|int] = full_yaml[args.metadata]
-    global_train_params:Dict[str, Any] = full_yaml[args.global_config]
+    metadata: Dict[str, str | int] = full_yaml[args.metadata]
+    global_train_params: Dict[str, Any] = full_yaml[args.global_config]
     grid_spec = full_yaml[args.grid_name]
 
     set_seed(metadata.get("base_seed", 42))
